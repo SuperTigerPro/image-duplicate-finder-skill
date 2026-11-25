@@ -67,11 +67,17 @@ def checked_stream(record):
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(record.path, flags)
     try:
-        assert_unchanged(record, os.fstat(fd))
+        assert_unchanged(record, os.stat(record.path, follow_symlinks=False))
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or signature(opened)[:3] != record.stamp[:3]:
+            raise ChangedFileError("打开的文件与扫描记录不一致，请重新扫描")
+        # Windows stat/fstat can expose different timestamp precision. Compare
+        # timestamps within the SAME API, while cross-checking identity and size.
+        opened_record = ImageFile(record.path, record.size, signature(opened))
         # Keep fd alive even if an image decoder closes its supplied stream.
         with os.fdopen(os.dup(fd), "rb") as stream:
             yield stream
-        assert_unchanged(record, os.fstat(fd))
+        assert_unchanged(opened_record, os.fstat(fd))
         assert_unchanged(record, os.stat(record.path, follow_symlinks=False))
     finally:
         os.close(fd)
@@ -406,6 +412,10 @@ def parse_extensions(value):
 
 
 def main(argv=None):
+    # Deterministic UTF-8 also when Windows redirects output or Python runs -I.
+    for output in (sys.stdout, sys.stderr):
+        if output is not None and hasattr(output, "reconfigure"):
+            output.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser(description="本地图片查重：只读扫描，列出完全相同的图片，不删除原图。")
     parser.add_argument("paths", nargs="+", help="一个或多个本地文件夹/图片路径（含空格时加引号）")
     parser.add_argument("--version", action="version", version=VERSION)

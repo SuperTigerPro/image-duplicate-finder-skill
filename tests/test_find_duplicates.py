@@ -323,6 +323,45 @@ class SafetyAndReportTests(Fixture):
         self.assertFalse(report["complete"])
         self.assertEqual(report["summary"]["errors"], 2)
 
+    def test_stat_and_fstat_timestamp_precision_differences_are_not_changes(self):
+        self.write("a.png")
+        self.write("b.png")
+        original = finder.os.fstat
+        def different_precision(fd):
+            info = original(fd)
+            return SimpleNamespace(st_mode=info.st_mode, st_dev=info.st_dev,
+                                   st_ino=info.st_ino, st_size=info.st_size,
+                                   st_mtime_ns=info.st_mtime_ns - 7,
+                                   st_ctime_ns=info.st_ctime_ns - 7)
+        with mock.patch.object(finder.os, "fstat", side_effect=different_precision):
+            report = self.scan()
+        self.assertTrue(report["complete"], report["errors"])
+        self.assertEqual(report["summary"]["duplicate_images"], 2)
+
+    def test_same_size_file_change_is_still_detected(self):
+        first = self.write("a.png", b"same")
+        self.write("b.png", b"same")
+        old_mtime = first.stat().st_mtime_ns
+        original = finder.exact_digest
+        def mutating_digest(stream):
+            result = original(stream)
+            first.write_bytes(b"diff")
+            os.utime(first, ns=(old_mtime, old_mtime + 1_000_000_000))
+            return result
+        with mock.patch.object(finder, "exact_digest", side_effect=mutating_digest):
+            report = self.scan()
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["groups"], [])
+        self.assertEqual(report["errors"][0]["error_type"], "ChangedFileError")
+
+    def test_cli_is_utf8_even_with_ascii_process_locale(self):
+        self.write("中文.png")
+        environment = dict(os.environ, PYTHONIOENCODING="ascii")
+        result = subprocess.run([sys.executable, str(SCRIPT), str(self.images)],
+                                capture_output=True, timeout=30, env=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("图片查重", result.stdout.decode("utf-8"))
+
     def test_file_changed_during_read_rejected(self):
         first = self.write("a.png", b"same")
         self.write("b.png", b"same")

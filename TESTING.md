@@ -6,8 +6,8 @@
 
 | 环境 | 结果 |
 | --- | --- |
-| macOS / arm64，Python 3.12.14 + Pillow 12.3.0 | 51 项测试（含 Skill 结构与文档校验）全部通过，无跳过 |
-| macOS / arm64，Python 3.10.12 + Pillow 10.4.0 | 51 项测试（含 Skill 结构与文档校验）全部通过，无跳过 |
+| macOS / arm64，Python 3.12.14 + Pillow 12.3.0 | 54 项测试（含 Skill 结构、文档和跨平台回归校验）全部通过，无跳过 |
+| macOS / arm64，Python 3.10.12 + Pillow 10.4.0 | 54 项测试（含 Skill 结构、文档和跨平台回归校验）全部通过，无跳过 |
 | 隔离 Python（禁用 site-packages） | exact 可用；pixels 提供明确的依赖缺失提示并返回 2 |
 | Python 语法编译 | 通过 |
 
@@ -60,6 +60,7 @@ python3 -m compileall -q scripts tests
 - CSV / JSON / Markdown 一致性、恶意控制字符和 HTML 文件名。
 - 报告目录已存在、源图片被误选为输出位置、报告写入失败。
 - 缺少 Pillow、无第三方包的 exact 运行、无输出目录的纯终端模式。
+- Windows stat/fstat 纳秒精度差异模拟、同大小文件修改检测，以及 ASCII/隔离解释器中的 UTF-8 输出。
 
 ## 持续集成
 
