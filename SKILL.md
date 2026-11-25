@@ -18,6 +18,12 @@ metadata:
 - 所有 shell 路径必须正确引用；用户可控路径作为独立参数传递，不拼接成未经转义的 shell 代码。
 - 不跟随符号链接。报告中的“参考”只表示按完整路径排序的首项，不是保留/删除建议。
 
+## 跨模型与宿主
+
+本 Skill 不依赖特定模型。支持标准 Agent Skills 且有本地 Python 工具的宿主可以直接执行；需要工具接口的 GPT / DeepSeek 等 Agent 可使用 [JSON 适配器与兼容说明](references/client-compatibility.md)。
+
+ChatGPT、GPT 或 DeepSeek 普通聊天没有本地工具时，不得假装能访问本机目录。改为使用 [通用提示词](references/universal-agent-prompt.md) 提供本地命令，由用户在本机执行后反馈必要统计或脱敏报告。不要默认上传图片到云端；GPT Knowledge、Actions 和 Skill 是不同机制，说明文件不能自行授予本地权限。
+
 ## 执行流程
 
 ### 1. 确定范围与判定方式

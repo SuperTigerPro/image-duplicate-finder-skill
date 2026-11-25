@@ -6,8 +6,8 @@
 
 | 环境 | 结果 |
 | --- | --- |
-| macOS / arm64，Python 3.12.14 + Pillow 12.3.0 | 54 项测试（含 Skill 结构、文档和跨平台回归校验）全部通过，无跳过 |
-| macOS / arm64，Python 3.10.12 + Pillow 10.4.0 | 54 项测试（含 Skill 结构、文档和跨平台回归校验）全部通过，无跳过 |
+| macOS / arm64，Python 3.12.14 + Pillow 12.3.0 | 64 项测试（含 Skill 结构、文档、跨平台回归与通用工具适配）全部通过，无跳过 |
+| macOS / arm64，Python 3.10.12 + Pillow 10.4.0 | 64 项测试（含 Skill 结构、文档、跨平台回归与通用工具适配）全部通过，无跳过 |
 | 隔离 Python（禁用 site-packages） | exact 可用；pixels 提供明确的依赖缺失提示并返回 2 |
 | Python 语法编译 | 通过 |
 
@@ -61,6 +61,10 @@ python3 -m compileall -q scripts tests
 - 报告目录已存在、源图片被误选为输出位置、报告写入失败。
 - 缺少 Pillow、无第三方包的 exact 运行、无输出目录的纯终端模式。
 - Windows stat/fstat 纳秒精度差异模拟、同大小文件修改检测，以及 ASCII/隔离解释器中的 UTF-8 输出。
+
+## 通用模型工具入口验证
+
+[JSON 适配器](scripts/tool_adapter.py) 与 [工具定义](adapters/chat-completions-tools.json) 的 10 项测试覆盖：函数契约、纯 JSON 输入输出、两种查重模式、宿主输入白名单、报告位置限制、已有报告不复用、严格参数类型、部分错误结果、非法 JSON 与 1 MiB 请求上限。没有使用模型 API Key，也没有声称已在每一种商业聊天客户端完成账号级集成。宿主能力与接入条件见 [兼容说明](references/client-compatibility.md)。
 
 ## 持续集成
 

@@ -5,9 +5,11 @@ from pathlib import Path
 from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[1]
-DOCUMENTS = ("SKILL.md", "README.md", "TESTING.md", "references/report-format.md")
+DOCUMENTS = ("SKILL.md", "README.md", "TESTING.md", "references/report-format.md",
+             "references/client-compatibility.md", "references/universal-agent-prompt.md")
 REQUIRED = DOCUMENTS + (
     "scripts/find_duplicates.py", "tests/test_find_duplicates.py",
+    "scripts/tool_adapter.py", "tests/test_tool_adapter.py", "adapters/chat-completions-tools.json",
     "tests/test_skill_package.py", "requirements-pixels.txt", "LICENSE",
     ".gitignore", ".gitattributes", ".github/workflows/tests.yml",
 )

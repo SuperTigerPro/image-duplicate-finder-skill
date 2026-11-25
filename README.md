@@ -19,6 +19,16 @@
 
 **不做**相似图检索、人脸聚类、裁剪/缩放图比对，也不提供自动删除操作。
 
+## 跨模型与客户端
+
+扫描器不绑定任何模型、模型 SDK 或 API Key。除了标准 Skill，还提供 [通用 Agent / 自定义 GPT 提示词](references/universal-agent-prompt.md)、[客户端兼容说明](references/client-compatibility.md) 及 [Chat Completions 函数工具定义](adapters/chat-completions-tools.json)。
+
+- 支持 Skill 和本地执行的 Agent（包括 DeepSeek Harness 等）可直接调用。
+- GPT / DeepSeek 等模型的本地 Agent 宿主可通过 JSON 适配器接入，输入与输出目录由宿主白名单限制。
+- 普通 ChatGPT / 自定义 GPT / DeepSeek 聊天如果没有本地文件工具，只能提供本机运行指引并解释结果，不能声称直接读到了硬盘。GPT Actions 需要 OpenAPI 桥接，工具 JSON 不能直接导入 Actions。
+
+详细条件和示例见 [兼容矩阵与接入文档](references/client-compatibility.md)。图片无需发送给模型；报告中的本地路径也应按用户隐私偏好脱敏。
+
 ## 作为 Skill 安装
 
 入口是根目录的 [SKILL.md](SKILL.md)，实现脚本随仓库一起分发。
