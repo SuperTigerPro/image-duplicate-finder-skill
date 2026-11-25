@@ -1,0 +1,2 @@
+# Optional: exact mode has no third-party dependencies.
+Pillow>=10.4.0
