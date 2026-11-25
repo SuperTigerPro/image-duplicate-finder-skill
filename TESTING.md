@@ -6,22 +6,22 @@
 
 | 环境 | 结果 |
 | --- | --- |
-| macOS / arm64，Python 3.12.14 + Pillow 12.3.0 | 64 项测试（含 Skill 结构、文档、跨平台回归与通用工具适配）全部通过，无跳过 |
-| macOS / arm64，Python 3.10.12 + Pillow 10.4.0 | 64 项测试（含 Skill 结构、文档、跨平台回归与通用工具适配）全部通过，无跳过 |
+| macOS / arm64，Python 3.12.14 + Pillow 12.3.0 + NumPy 2.3.5 | 106 项测试（含严格/相似检测、单阈值一致性、报告与通用工具适配）全部通过，无跳过 |
+| macOS / arm64，Python 3.10.12 + Pillow 10.4.0 + NumPy 1.24.0 | 106 项测试（含最低依赖版本兼容性）全部通过，无跳过 |
 | 隔离 Python（禁用 site-packages） | exact 可用；pixels 提供明确的依赖缺失提示并返回 2 |
 | Python 语法编译 | 通过 |
 
 完整测试命令：
 
 ~~~bash
-python3 -m pip install -r requirements-pixels.txt
+python3 -m pip install -r requirements-similar.txt
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q scripts tests
 ~~~
 
-上述安装命令应在虚拟环境中运行。安装依赖请优先选择最新兼容版本；最低版本测试用于验证兼容性，不建议因此降级现有 Pillow。
+上述安装命令应在虚拟环境中运行。安装依赖请优先选择最新兼容版本；最低版本测试用于验证兼容性，不建议因此降级现有Pillow或NumPy。
 
-## 端到端报告验证
+## 严格查重端到端报告验证（exact / pixels）
 
 在被 Git 忽略的本地临时测试目录中生成 8 个图片路径：
 
@@ -46,6 +46,23 @@ python3 -m compileall -q scripts tests
 
 结果符合预期：元数据变体和 BMP 仅在 pixels 中归组；单像素差异图和后续帧不同的 GIF 没有被误判。CSV 成员数与 JSON 一致；对全部合成原图的 SHA-256、文件名和修改时间进行前后对照，确认未改动。
 
+## 相似检测专项与端到端验证
+
+[专项测试](tests/test_image_similarity.py) 包含38项：缩放、JPEG压缩、轻微亮度/模糊、严格100与pixels对照、0接纳全部有效对、全部101个整数门槛的固定评分检查、完整扫描结果单调性、BK-tree对照暴力搜索、SSIM直接公式对照、颜色/透明度/ICC、低纹理与低对比度、非传递链、动画/多页/高位深拒绝、文件变化移除、内部安全上限、CSV/JSON/Markdown/预览一致性、原图不变及缺失依赖。
+
+另用8张独立随机纹理合成源图，各生成原图、字节副本、JPEG quality=70、缩小一半和亮度×1.03版本，共40个路径；同源图片对共80对。通过真实CLI分别执行：
+
+| 门槛 | 匹配图片对 | 其中同源对 | 不同源误匹配 | 严格像素相同对 |
+| --- | --- | --- | --- | --- |
+| 80 | 80 | 80 | 0 | 8 |
+| 90（推荐） | 80 | 80 | 0 | 8 |
+| 95 | 80 | 80 | 0 | 8 |
+| 100 | 8 | 8 | 0 | 8 |
+
+四次扫描均complete=true、退出0；同一对图片分数不随门槛变化；所有合成原图的SHA-256、文件名和mtime前后不变。并排预览已目视检查，完整清单与预览ID对应。100只保留8对原图/字节副本，不把缩放后缩略图一致的图片误判为100。
+
+上述变体较轻，80/90/95结果相同是允许的非严格单调关系；另有95门槛下A-B、B-C通过而A-C不通过的边界测试，证明不进行传递合并。它们都是可控合成样本，**不是自然图库的通用准确率或召回率承诺**。算法范围与默认值见 [相似说明](references/similarity.md)。
+
 ## 重点回归场景
 
 - 中文/空格路径、不同文件名、同名不同内容、大小写扩展名。
@@ -64,7 +81,7 @@ python3 -m compileall -q scripts tests
 
 ## 通用模型工具入口验证
 
-[JSON 适配器](scripts/tool_adapter.py) 与 [工具定义](adapters/chat-completions-tools.json) 的 10 项测试覆盖：函数契约、纯 JSON 输入输出、两种查重模式、宿主输入白名单、报告位置限制、已有报告不复用、严格参数类型、部分错误结果、非法 JSON 与 1 MiB 请求上限。没有使用模型 API Key，也没有声称已在每一种商业聊天客户端完成账号级集成。宿主能力与接入条件见 [兼容说明](references/client-compatibility.md)。
+[JSON 适配器](scripts/tool_adapter.py) 与 [工具定义](adapters/chat-completions-tools.json) 的14项测试覆盖：函数契约、纯JSON输入输出、三种模式、相似默认90/严格100、门槛类型与范围、宿主输入白名单、报告位置限制、已有报告不复用、部分错误、非法JSON与1 MiB上限。没有使用模型 API Key，也没有声称已在每一种商业聊天客户端完成账号级集成。宿主能力与接入条件见 [兼容说明](references/client-compatibility.md)。
 
 ## 持续集成
 

@@ -16,6 +16,7 @@ except ImportError:
 
 MAX_REQUEST_BYTES = 1024 * 1024
 FIELDS = {"paths", "mode", "output_dir", "recursive", "include_hidden"}
+OPTIONAL_FIELDS = {"similarity_threshold"}
 
 
 def inside(path, root):
@@ -24,13 +25,20 @@ def inside(path, root):
 
 def run_request(request, allowed_roots, report_root):
     """Host-controlled roots cannot be expanded by model-supplied JSON."""
-    if not isinstance(request, dict) or set(request) != FIELDS:
-        raise ValueError("参数必须且只能包含 paths、mode、output_dir、recursive、include_hidden")
+    if (not isinstance(request, dict) or not FIELDS <= set(request)
+            or not set(request) <= FIELDS | OPTIONAL_FIELDS):
+        raise ValueError("需要 paths、mode、output_dir、recursive、include_hidden；仅允许额外的 similarity_threshold")
     paths = request["paths"]
     if not isinstance(paths, list) or not paths or not all(isinstance(p, str) and p for p in paths):
         raise ValueError("paths 必须是非空路径字符串数组")
-    if request["mode"] not in ("exact", "pixels"):
-        raise ValueError("mode 必须是 exact 或 pixels")
+    if request["mode"] not in ("exact", "pixels", "similar"):
+        raise ValueError("mode 必须是 exact、pixels 或 similar")
+    threshold = request.get("similarity_threshold")
+    if "similarity_threshold" in request:
+        if type(threshold) is not int or not 0 <= threshold <= 100:
+            raise ValueError("相似度阈值必须是0～100的整数，推荐90")
+        if request["mode"] != "similar":
+            raise ValueError("similarity_threshold 仅适用于 similar 模式")
     if not isinstance(request["output_dir"], str) or not request["output_dir"]:
         raise ValueError("output_dir 必须是新报告目录的路径")
     if type(request["recursive"]) is not bool or type(request["include_hidden"]) is not bool:
@@ -48,6 +56,8 @@ def run_request(request, allowed_roots, report_root):
     if not inside(output, report_root) or output == report_root:
         raise ValueError("output_dir 必须是宿主报告根目录内的新子目录")
     arguments = ["--mode", request["mode"], "--output-dir", str(output)]
+    if threshold is not None:
+        arguments += ["--similarity-threshold", str(threshold)]
     if not request["recursive"]:
         arguments.append("--no-recursive")
     if request["include_hidden"]:

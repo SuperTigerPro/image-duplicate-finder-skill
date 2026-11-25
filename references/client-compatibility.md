@@ -45,6 +45,23 @@ python3 scripts/tool_adapter.py \
 
 不要让模型自行决定 --allow-root 为整个磁盘。用户选择变化时，由宿主重新取得用户授权并更新启动参数。白名单是额外校验，不是操作系统沙箱，仍应使用宿主的最小权限执行策略；遇到拒绝不可绕过。
 
+### 相似检测的可选单一参数
+
+mode 可取 exact、pixels、similar。旧的五个必填字段保持不变；仅similar允许额外的 similarity_threshold 整数字段，0～100，默认90。不能在exact/pixels里传入并被静默忽略，也不能传入字符串、布尔或小数。
+
+~~~json
+{
+  "paths": ["/data/用户选定的图片"],
+  "mode": "similar",
+  "similarity_threshold": 90,
+  "output_dir": "/work/reports/similar-001",
+  "recursive": true,
+  "include_hidden": false
+}
+~~~
+
+用户未提门槛就直接用90，不追问内部算法指标。较低值更宽松、较高值更严；100严格核验原始解码像素。相似报告schema_version=2，要读取similar_pairs而不是空groups；preview指向报告目录中的本地缩略预览。不要自动将预览或完整路径发送给云端模型。环境另需 [相似依赖](../requirements-similar.txt)，逻辑和限制见 [相似检测说明](similarity.md)。
+
 ### 返回值
 
 在宿主启动参数有效时，stdout 是一个 JSON 对象，不混入面向人类的日志。进程退出码与 exit_code 一致：

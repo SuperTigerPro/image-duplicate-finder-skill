@@ -6,10 +6,12 @@ from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCUMENTS = ("SKILL.md", "README.md", "TESTING.md", "references/report-format.md",
-             "references/client-compatibility.md", "references/universal-agent-prompt.md")
+             "references/client-compatibility.md", "references/universal-agent-prompt.md",
+             "references/similarity.md")
 REQUIRED = DOCUMENTS + (
     "scripts/find_duplicates.py", "tests/test_find_duplicates.py",
     "scripts/tool_adapter.py", "tests/test_tool_adapter.py", "adapters/chat-completions-tools.json",
+    "scripts/image_similarity.py", "tests/test_image_similarity.py", "requirements-similar.txt",
     "tests/test_skill_package.py", "requirements-pixels.txt", "LICENSE",
     ".gitignore", ".gitattributes", ".github/workflows/tests.yml",
 )
@@ -37,6 +39,9 @@ class SkillPackageTests(unittest.TestCase):
         self.assertGreater(len(values["description"]), 10)
         self.assertLessEqual(len(values["description"]), 1024)
         self.assertEqual(values["license"], "MIT")
+        source = (ROOT / "scripts/find_duplicates.py").read_text(encoding="utf-8")
+        version = re.search(r'^VERSION = "([^\"]+)"', source, re.MULTILINE).group(1)
+        self.assertIn(f'  version: "{version}"', front)
         self.assertLessEqual(len(values["compatibility"]), 500)
 
     def test_local_markdown_links_point_to_packaged_resources(self):

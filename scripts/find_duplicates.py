@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 CHUNK_SIZE = 1024 * 1024
 DEFAULT_EXTENSIONS = (
     ".jpg", ".jpeg", ".jfif", ".png", ".apng", ".gif", ".webp", ".bmp",
@@ -154,6 +154,14 @@ def pixel_digest(stream, options, pillow):
     return digest.hexdigest()
 
 
+def similarity_module():
+    if __package__:
+        from . import image_similarity
+    else:
+        import image_similarity
+    return image_similarity
+
+
 class Scanner:
     def __init__(self, roots, options, pillow=None):
         self.roots = roots
@@ -230,6 +238,8 @@ class Scanner:
                 # An explicitly selected hidden file/root is not filtered out.
                 self.add_file(root)
         self.files.sort(key=lambda item: str(item.path))
+        if self.options.mode == "similar":
+            return similarity_module().scan(self, checked_stream, pixel_digest, assert_unchanged, VERSION)
         if self.options.mode == "exact":
             by_size = defaultdict(list)
             for record in self.files:
@@ -309,6 +319,8 @@ class Scanner:
 
 
 def markdown_report(report):
+    if report["mode"] == "similar":
+        return similarity_module().markdown_report(report, display_text)
     def code(value):
         return "<code>" + html.escape(display_text(value)) + "</code>"
 
@@ -350,25 +362,36 @@ def markdown_report(report):
     return "\n".join(lines)
 
 
-def write_reports(report, directory):
+def write_reports(report, directory, preview_png=None):
     """Only create a NEW directory. Never overwrite existing reports or images."""
     directory.mkdir(parents=True, exist_ok=False)
+    if report["mode"] == "similar" and preview_png is None:
+        report["preview"] = None
     with (directory / "duplicates.json").open("x", encoding="utf-8") as stream:
         json.dump(report, stream, ensure_ascii=False, indent=2)
         stream.write("\n")
     with (directory / "duplicates.csv").open("x", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["group_id", "role", "digest", "size_bytes", "path", "hard_link_to"])
-        for group in report["groups"]:
-            for index, item in enumerate(group["files"]):
-                # All path cells are absolute, so filenames cannot start an Excel formula.
-                writer.writerow([group["id"], "reference" if index == 0 else "duplicate",
-                                 group["digest"], item["size_bytes"], item["path"], item["hard_link_to"] or ""])
+        if report["mode"] == "similar":
+            similarity_module().write_csv(writer, report)
+        else:
+            writer.writerow(["group_id", "role", "digest", "size_bytes", "path", "hard_link_to"])
+            for group in report["groups"]:
+                for index, item in enumerate(group["files"]):
+                    # Absolute path cells cannot start an Excel formula.
+                    writer.writerow([group["id"], "reference" if index == 0 else "duplicate",
+                                     group["digest"], item["size_bytes"], item["path"], item["hard_link_to"] or ""])
     with (directory / "duplicates.md").open("x", encoding="utf-8") as stream:
         stream.write(markdown_report(report))
+    if preview_png is not None:
+        with (directory / "similarity-preview.png").open("xb") as stream:
+            stream.write(preview_png)
 
 
 def print_report(report):
+    if report["mode"] == "similar":
+        similarity_module().print_report(report, display_text)
+        return
     summary = report["summary"]
     print(f"图片查重 | {report['mode']} | {'完整' if report['complete'] else '不完整'}")
     print(f"候选图片 {summary['scanned_images']}；重复组 {summary['duplicate_groups']}；"
@@ -399,6 +422,16 @@ def positive_integer(value):
     return result
 
 
+def similarity_threshold(value):
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("相似度门槛必须是0～100的整数，推荐90") from exc
+    if not 0 <= result <= 100:
+        raise argparse.ArgumentTypeError("相似度门槛必须在0～100之间，推荐90")
+    return result
+
+
 def parse_extensions(value):
     if value.strip() == "*":
         return None
@@ -416,23 +449,29 @@ def main(argv=None):
     for output in (sys.stdout, sys.stderr):
         if output is not None and hasattr(output, "reconfigure"):
             output.reconfigure(encoding="utf-8", errors="backslashreplace")
-    parser = argparse.ArgumentParser(description="本地图片查重：只读扫描，列出完全相同的图片，不删除原图。")
+    parser = argparse.ArgumentParser(description="本地图片查重与相似检测：只读扫描，不删除原图。")
     parser.add_argument("paths", nargs="+", help="一个或多个本地文件夹/图片路径（含空格时加引号）")
     parser.add_argument("--version", action="version", version=VERSION)
-    parser.add_argument("--mode", choices=("exact", "pixels"), default="exact",
-                        help="exact=原始文件 SHA-256（默认，无依赖）；pixels=完整解码像素（需要 Pillow）")
+    parser.add_argument("--mode", choices=("exact", "pixels", "similar"), default="exact",
+                        help="exact=字节完全相同（默认）；pixels=像素完全相同；similar=静态整图相似")
+    parser.add_argument("--similarity-threshold", type=similarity_threshold, default=None,
+                        help="similar唯一调参项：0～100整数，默认90；越高越严，100须严格像素相同")
     parser.add_argument("--no-recursive", action="store_false", dest="recursive", help="不扫描子文件夹")
     parser.add_argument("--include-hidden", action="store_true", help="包括隐藏文件/文件夹（仍不跟随符号链接）")
     parser.add_argument("--extensions", type=parse_extensions, default=set(DEFAULT_EXTENSIONS),
                         help="自定义扩展名，例如 jpg,png；* 包括所有文件，必须用引号包裹")
     parser.add_argument("--output-dir", type=Path, help="新建报告目录，写入 JSON/CSV/Markdown；已存在则拒绝覆盖")
     parser.add_argument("--max-pixels", type=positive_integer, default=40_000_000,
-                        help="pixels 模式单帧像素上限，默认 40000000")
+                        help="pixels/similar 单帧像素安全上限，默认 40000000")
     parser.add_argument("--max-frames", type=positive_integer, default=200,
                         help="pixels 模式帧数上限，默认 200")
     parser.add_argument("--max-total-pixels", type=positive_integer, default=100_000_000,
                         help="pixels 模式单文件所有帧累计像素上限，默认 100000000")
     options = parser.parse_args(argv)
+    if options.mode != "similar" and options.similarity_threshold is not None:
+        parser.error("--similarity-threshold 仅适用于 --mode similar")
+    if options.similarity_threshold is None:
+        options.similarity_threshold = 90
     roots = []
     for value in options.paths:
         path = Path(value).expanduser()
@@ -451,17 +490,25 @@ def main(argv=None):
         if os.path.lexists(options.output_dir):
             parser.error("报告目录已存在，不会覆盖：" + display_text(options.output_dir))
     pillow = None
-    if options.mode == "pixels":
+    if options.mode in ("pixels", "similar"):
         try:
             from PIL import Image, ImageOps
         except ImportError:
-            parser.error("pixels 模式需要 Pillow。请用同一个 Python 安装：python3 -m pip install 'Pillow>=10.4.0'")
+            parser.error(f"{options.mode} 模式需要 Pillow。请用同一个 Python 安装：python3 -m pip install 'Pillow>=10.4.0'")
         pillow = (Image, ImageOps)
-    report = Scanner(roots, options, pillow).run()
+    if options.mode == "similar":
+        try:
+            similarity_module()
+        except ImportError:
+            parser.error("similar 模式需要 Pillow 和 NumPy；请在同一虚拟环境安装 requirements-similar.txt")
+        if options.similarity_threshold < 80:
+            print("提示：当前阈值低于建议范围80～95，误报和计算量可能增加；默认推荐90。", file=sys.stderr)
+    scanner = Scanner(roots, options, pillow)
+    report = scanner.run()
     print_report(report)
     if options.output_dir is not None:
         try:
-            write_reports(report, options.output_dir)
+            write_reports(report, options.output_dir, getattr(scanner, "preview_png", None))
         except OSError as exc:
             print("报告写入失败（可能留下不完整的新报告目录）：" + display_text(exc), file=sys.stderr)
             return 2

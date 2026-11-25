@@ -1,0 +1,3 @@
+# Optional: only --mode similar needs NumPy in addition to Pillow.
+-r requirements-pixels.txt
+NumPy>=1.24.0

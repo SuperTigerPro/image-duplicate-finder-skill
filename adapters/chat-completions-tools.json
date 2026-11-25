@@ -3,7 +3,7 @@
     "type": "function",
     "function": {
       "name": "find_image_duplicates",
-      "description": "Scan only user-authorized local image paths, read-only. Group byte-identical or decoded-pixel-identical images. Never delete, modify, or upload images. Requires a local host to execute the bundled JSON adapter.",
+      "description": "Read-only local image duplicate and static-image similarity detection. Never delete, modify or upload images. A local host with authorized path roots must execute the adapter.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -20,9 +20,10 @@
             "type": "string",
             "enum": [
               "exact",
-              "pixels"
+              "pixels",
+              "similar"
             ],
-            "description": "exact compares raw SHA-256; pixels compares all decoded frames and requires Pillow."
+            "description": "exact: raw SHA-256; pixels: full decoded pixels (Pillow); similar: static whole-image similarity (Pillow + NumPy)."
           },
           "output_dir": {
             "type": "string",
@@ -36,6 +37,13 @@
           "include_hidden": {
             "type": "boolean",
             "description": "Include hidden entries only when requested. Normally false."
+          },
+          "similarity_threshold": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "default": 90,
+            "description": "Optional ONLY for similar mode: the single similarity control. Higher is stricter. Recommended 90, normal range 80–95, 100 requires strict full-resolution pixel equality. Not a probability."
           }
         },
         "required": [

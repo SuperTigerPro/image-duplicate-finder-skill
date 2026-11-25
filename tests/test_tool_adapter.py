@@ -1,5 +1,6 @@
 """Provider-neutral adapter contract and local path authorization tests."""
 import json
+import importlib.util
 import os
 import subprocess
 import sys
@@ -38,7 +39,9 @@ class ToolAdapterTests(Fixture):
         parameters = function["parameters"]
         self.assertFalse(parameters["additionalProperties"])
         self.assertEqual(set(parameters["required"]), set(self.request()))
-        self.assertEqual(set(parameters["properties"]), set(self.request()))
+        self.assertEqual(set(parameters["properties"]), set(self.request()) | {"similarity_threshold"})
+        self.assertEqual(parameters["properties"]["similarity_threshold"]["default"], 90)
+        self.assertEqual(parameters["properties"]["mode"]["enum"], ["exact", "pixels", "similar"])
 
     def test_json_only_exact_roundtrip_and_reports(self):
         self.write("a.png")
@@ -59,6 +62,41 @@ class ToolAdapterTests(Fixture):
         self.assertEqual(result.returncode, 0, response)
         self.assertEqual(response["report"]["mode"], "pixels")
         self.assertEqual(response["report"]["summary"]["duplicate_images"], 2)
+
+    @unittest.skipUnless(Image is not None and importlib.util.find_spec("numpy") is not None,
+                         "Install requirements-similar.txt")
+    def test_similarity_default_threshold_is_90(self):
+        self.write("a.png")
+        self.write("b.png")
+        result, response = self.invoke_adapter(self.request(mode="similar"))
+        self.assertEqual(result.returncode, 0, response)
+        self.assertEqual(response["report"]["schema_version"], 2)
+        self.assertEqual(response["report"]["similarity_threshold"], 90)
+        self.assertEqual(response["report"]["summary"]["similar_pairs"], 1)
+
+    @unittest.skipUnless(Image is not None and importlib.util.find_spec("numpy") is not None,
+                         "Install requirements-similar.txt")
+    def test_similarity_single_threshold_roundtrip(self):
+        self.write("a.png")
+        self.write("b.png")
+        result, response = self.invoke_adapter(self.request(mode="similar", similarity_threshold=100))
+        self.assertEqual(result.returncode, 0, response)
+        self.assertEqual(response["report"]["similarity_threshold"], 100)
+        self.assertTrue(response["report"]["similar_pairs"][0]["pixel_identical"])
+        self.assertTrue((self.root / "reports/new-run/similarity-preview.png").is_file())
+
+    def test_invalid_similarity_threshold_types_and_range_rejected(self):
+        for threshold in (True, None, -1, 101, "90", 90.5):
+            with self.subTest(threshold=threshold):
+                result, response = self.invoke_adapter(self.request(mode="similar", similarity_threshold=threshold))
+                self.assertEqual(result.returncode, 2)
+                self.assertIsNone(response["report"])
+                self.assertIn("阈值", response["stderr"])
+
+    def test_similarity_threshold_cannot_be_silently_ignored_in_exact(self):
+        result, response = self.invoke_adapter(self.request(similarity_threshold=90))
+        self.assertEqual(result.returncode, 2)
+        self.assertIsNone(response["report"])
 
     def test_input_outside_host_allowed_roots_rejected(self):
         outside = self.root / "outside.png"

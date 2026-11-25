@@ -1,13 +1,13 @@
 ---
 name: image-duplicate-finder-skill
-description: 在用户指定的本地文件夹中查找并分组罗列重复相同的图片。适用于“图片查重”“重复照片”“找出相同图片”“比较多个图片目录”等请求。支持原始文件 SHA-256 完全相同，以及忽略普通元数据、校正 EXIF 方向后的解码像素相同；只读扫描，输出完整路径清单和 CSV、JSON、Markdown 报告，不删除或上传原图。不用于相似图、裁剪图、盗图检索或网站查重。
+description: 在用户指定的本地文件夹中查找重复或疑似相似图片。适用于图片查重、重复照片、找出相同或相似图片、比较图片目录。支持文件SHA-256、完整解码像素和静态整图相似三种模式；相似检测只需一个0～100整数门槛，默认推荐90，内部指标自动联动。只读扫描，输出完整路径、CSV/JSON/Markdown和本地相似对预览；不删除或上传原图，不做裁剪、局部复用、语义或网站查重。
 license: MIT
-compatibility: Python 3.10+；像素模式可选安装 Pillow 10.4+；支持 macOS、Linux、Windows。
+compatibility: Python 3.10+；pixels需Pillow 10.4+，similar另需NumPy 1.24+；支持macOS、Linux、Windows。
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
-# 本地图片查重
+# 本地图片查重与相似检测
 
 ## 安全约束
 
@@ -32,23 +32,24 @@ ChatGPT、GPT 或 DeepSeek 普通聊天没有本地工具时，不得假装能�
 
 - **exact（默认）**：先按大小筛选，再流式计算文件 SHA-256。检测字节相同的副本；不同文件名不影响结果。只需要 Python 标准库。
 - **pixels（用户要求内容相同、忽略元数据或跨无损格式时）**：使用 Pillow 校正 EXIF 方向；普通 8 位图归一为 RGBA 后比较尺寸和全部像素。动画/多页图比较全部解码帧，并比较动画时长、循环与 ICC 配置。
-- 不做感知哈希、相似度阈值、缩放、裁剪或有损压缩容差。重新压缩的 JPEG 通常不属于像素完全相同。
+- **similar（用户要求相似图时）**：静态整图相似检测，覆盖常见缩放、重新压缩和轻微亮度/颜色变化。唯一算法调参项是 `--similarity-threshold`，0～100整数，默认推荐90，日常80～95；越高越严。用户未指定时直接用90，不让用户选择 pHash、SSIM 等内部参数。100须通过完整分辨率严格像素核验，其余均为疑似相似。
+- exact/pixels 不容忍像素变化。similar 也不启用裁剪、局部复用、任意旋转/翻转或语义检索。完整评分、资源与范围见 [相似检测说明](references/similarity.md)。
 - 用户没有指定判定方式时，说明默认是“文件字节完全相同”；不要把 exact 未发现重复解释成没有像素相同的图。
-- 用户要求两种方式都检查时分别运行到两个新报告目录，不把两种分组混合计数。
+- 用户要求多种方式都检查时分别运行到新的报告目录，不把严格重复组和疑似相似对混合计数。相似关系不传递，不用A像B、B像C推断A像C。
 
 ### 2. 准备环境
 
 1. 将本 Skill 所在目录记为 `SKILL_DIR`（下方命令中自行替换为真实路径；不要使用扫描目录代替）。
 2. 检查可用 Python 版本至少为 3.10。优先使用运行平台提供的 Python 或已有虚拟环境。
-3. exact 模式不用安装依赖。pixels 模式先用同一解释器测试能否导入 PIL。
-4. 如需安装 Pillow，按运行环境权限规则，在本 Skill 或其他获准工作目录的新虚拟环境安装，不修改系统 Python：
+3. exact 无第三方依赖；pixels 检查能否导入 PIL；similar 检查 PIL 和 numpy。
+4. 缺依赖时按模式自动准备，不让用户选择底层库。只需 pixels 时安装 requirements-pixels.txt；需要 similar 时安装 requirements-similar.txt（已包含Pillow）。按权限规则使用获准目录的新虚拟环境，不改系统Python。下方示例安装完整能力：
 
 ~~~bash
 python3 -m venv .venv
 # macOS / Linux
-.venv/bin/python -m pip install -r requirements-pixels.txt
+.venv/bin/python -m pip install -r requirements-similar.txt
 # Windows PowerShell
-.venv\Scripts\python.exe -m pip install -r requirements-pixels.txt
+.venv\Scripts\python.exe -m pip install -r requirements-similar.txt
 ~~~
 
 后续始终使用同一 Python。遇到权限拒绝就停下说明原因，不绕过沙箱或自动提升权限。
@@ -63,9 +64,14 @@ python3 "<SKILL_DIR>/scripts/find_duplicates.py" "/用户选择的/图片 文件
 
 python3 "<SKILL_DIR>/scripts/find_duplicates.py" "/图片目录A" "/图片目录B" \
   --mode pixels --output-dir "/可写工作目录/像素查重报告-新名称"
+
+python3 "<SKILL_DIR>/scripts/find_duplicates.py" "/用户选择的图片目录" \
+  --mode similar --similarity-threshold 90 --output-dir "/可写工作目录/相似报告-新名称"
 ~~~
 
 常用选项：
+
+- `--similarity-threshold 90`：仅similar使用。嫌漏检多可调到80或85，嫌误报多调到95。低于80提示可能产生大量候选。评分不是概率或相同像素百分比；内部算法门槛自动推导，不提供其他相似度调参项。
 
 - `--no-recursive`：只检查选定目录的直接子文件。
 - `--include-hidden`：包含隐藏项；仍不跟随符号链接。显式指定的隐藏根目录/文件本身会被尊重。
@@ -102,6 +108,8 @@ exact 通过扩展名识别候选，不验证是否为有效图像；pixels 遇�
 5. 若有错误，明确结果不完整，说明未能处理的路径及原因。
 6. 说明未修改原图。额外副本逻辑字节不等于能释放的磁盘空间；硬链接会单独标注。
 
+similar模式读取schema_version=2的similar_pairs，按图片对、分数、当前门槛和严格像素一致标记交付；不要读取空groups后声称无相似图，也不计算可清理字节。报告有结果时附本地并排预览（仅前12对），完整清单仍以JSON/CSV/Markdown为准。有读取错误或达到内部安全上限时必须说明不完整，不能用部分结果宣称阈值召回关系。低纹理图即使高分也要人工复核。
+
 ## 自测
 
 在 Skill 根目录运行：
@@ -110,4 +118,4 @@ exact 通过扩展名识别候选，不验证是否为有效图像；pixels 遇�
 python3 -m unittest discover -s tests -v
 ~~~
 
-未安装 Pillow 时像素测试会跳过；完整验证须先安装 [requirements-pixels.txt](requirements-pixels.txt)，并确认没有跳过像素测试。测试只生成临时合成图片，不访问用户图库，也不联网。
+未安装Pillow/NumPy时对应测试会跳过；完整验证须安装 [requirements-similar.txt](requirements-similar.txt)，确认没有跳过图像专项测试。测试只生成临时合成图，不访问用户图库；依赖安装可能联网，扫描和测试本身不调用外部服务。

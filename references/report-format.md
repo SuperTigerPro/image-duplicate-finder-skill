@@ -1,4 +1,6 @@
-# 报告格式（schema_version = 1）
+# 报告格式
+
+exact / pixels 保持 schema_version=1。similar 使用 schema_version=2，按图片对报告，见文末“相似模式”。下面先说明原有严格查重结构。
 
 脚本在一个**新目录**中输出以下三种报告；已有目录拒绝覆盖。报告不嵌入图片内容，但含完整路径，分享前注意隐私。
 
@@ -90,4 +92,52 @@ group_id,role,digest,size_bytes,path,hard_link_to
 - pixels：版本化的 SHA-256，包含全部解码帧的尺寸、规范化模式、像素字节、动画时长、循环和 ICC 配置指纹。普通 8 位图归一到 RGBA；其他模式保留原始模式和解码数据。
 - pixels 指纹不应当作跨 Pillow 版本、跨解码器的长期图片标识。不同版本的解码行为可能不同。
 - exact 与 pixels 的 digest 不能直接互相比对；应同时检查 mode、algorithm 和 schema_version。
-- 两种模式都不是相似图检测算法。哈希判定的可靠性依赖 SHA-256 的抗碰撞性质。
+- exact/pixels 不是相似图检测。严格像素核验依赖SHA-256的抗碰撞性质；similar另按下述结构报告。
+
+## 相似模式：schema_version = 2
+
+模式为 similar，算法标识 static-similarity-min-v1；详细定义见 [相似检测](similarity.md)。仍有 tool、generated_at、inputs、options、complete、errors，但不要把疑似相似对当作重复组。
+
+新增/不同字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| similarity_threshold | 本次0～100整数门槛，默认90 |
+| similar_pairs | 达到当前门槛的逐对结果，按分数降序再按完整路径排序 |
+| groups | 恒为空数组，避免旧客户端误把相似关系当等价分组 |
+| options.derived_internal_gates | 从唯一门槛自动推导的内部门槛，仅供审计，不是额外用户参数 |
+| warnings | 非概率、非传递、范围和低门槛等说明 |
+| preview | 有图片对时包含 file、pairs_shown；预览最多12对，不限制完整清单 |
+| safety_limits | 内部图片/候选/结果安全上限；触发时有明确错误与退出码1 |
+
+summary 的新增字段为 similar_pairs、images_in_pairs、pixel_identical_pairs、candidate_pairs_checked、possible_pairs、safety_limit_reached。possible_pairs以成功提取特征的图片数计算；candidate_pairs_checked只统计索引筛出的候选数，不保证每对都执行耗时SSIM。原 duplicate_groups / duplicate_images / extra_copies / extra_copy_logical_bytes 等旧字段置0，不能据此判断相似模式是否有结果，也不据疑似相似计算磁盘收益。
+
+每个 similar_pairs 条目：
+
+~~~json
+{
+  "id": "S00001",
+  "score": 94.0,
+  "pixel_identical": false,
+  "same_inode": false,
+  "files": [
+    {"path": "/demo/a.png", "size_bytes": 100, "mtime_ns": 0, "width": 384, "height": 256},
+    {"path": "/demo/a-resized.png", "size_bytes": 80, "mtime_ns": 0, "width": 192, "height": 128}
+  ],
+  "metrics": {"phash_distance": 2, "dhash_distance": 3, "ssim": 0.97,
+              "color_score": 98.1, "alpha_score": 100.0, "aspect_score": 100.0, "icc_equal": true},
+  "warnings": []
+}
+~~~
+
+数值仅演示字段结构，不是对该示例逐项计算的结果。score固定定义并向下保留1位小数；100只给完整分辨率严格像素核验通过的图片对，其余上限99.9。文件按完整路径排序，与预览左右顺序一致。
+
+相似模式的 CSV 表头改为：
+
+~~~text
+pair_id,similarity_score,threshold,pixel_identical,path_a,path_b,size_a_bytes,size_b_bytes,same_inode
+~~~
+
+每个图片对一行；一个图片路径可能出现在多个图片对中，不能把行数当图片数。CSV仍为UTF-8 BOM，路径按标准CSV引用。Markdown为逐对分数/路径/警告，并引用有结果时生成的 similarity-preview.png。不要把预览包含的对数当总结果数。
+
+相似模式的安全上限、动画/多页/特殊模式不支持、损坏图和文件变化会记录 errors，complete=false，进程退出1。部分结果不适合做全目录阈值召回比较。原图不会被删除或修改。

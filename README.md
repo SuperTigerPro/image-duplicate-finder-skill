@@ -3,7 +3,7 @@
 [![Tests](https://github.com/SuperTigerPro/image-duplicate-finder-skill/actions/workflows/tests.yml/badge.svg)](https://github.com/SuperTigerPro/image-duplicate-finder-skill/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**在本地图片文件夹中找出并分组罗列完全相同的图片。只读，不删图，不上传。**
+**在本地文件夹中查找完全重复与疑似相似图片。相似检测只调一个0～100门槛，默认90。只读，不删图，不上传。**
 
 这是一个遵循 [Agent Skills](https://agentskills.io/specification) 目录规范的可复用 Skill，也可作为独立 Python 命令行工具使用。无需网站账号、API Key 或云端识图服务。
 
@@ -17,7 +17,9 @@
 - 跳过符号链接，去除重叠扫描路径带来的重复计数，标注硬链接。
 - 有坏图、权限或解码错误时继续处理其他图片，同时明确标记“结果不完整”。
 
-**不做**相似图检索、人脸聚类、裁剪/缩放图比对，也不提供自动删除操作。
+- **similar（新增）**：静态整图相似检测，覆盖常见缩放、重新压缩和轻微亮度变化，用户只调相似度门槛，内部指标自动联动。
+
+**不做**人脸聚类、裁剪/局部复用、任意旋转、语义检索或自动删除。相似候选与完全重复分开呈现。
 
 ## 跨模型与客户端
 
@@ -98,12 +100,42 @@ py -3 -m venv .venv
 
 **报告目录必须是新目录**；已存在时会拒绝，不会覆盖旧报告或原图。不要把上一次的输出目录反复用于新扫描。不传 `--output-dir` 时只打印清单。
 
+### 4. 相似图检测：只调一个门槛
+
+安装完整图像依赖后运行：
+
+~~~bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-similar.txt
+.venv/bin/python scripts/find_duplicates.py "/你的/图片 文件夹" \
+  --mode similar --similarity-threshold 90 --output-dir "./reports/similar-001"
+~~~
+
+不写 --similarity-threshold 时默认就是 **90**。范围是 **0～100的整数**，日常建议 **80～95**：
+
+| 门槛 | 感性理解 |
+| --- | --- |
+| 80 / 85 | 宽松一些，少漏候选，可能需要更多人工复核 |
+| **90（默认推荐）** | 一般情况下直接使用 |
+| 95 | 更严格，减少误报 |
+| 100 | 原始分辨率严格像素一致，不用缩略图相似冒充相同 |
+
+越高越严，越低越宽松。低于80会提示误报和计算量可能明显增加。用户不用选择 pHash、dHash、SSIM 或颜色权重，程序根据同一个门槛自动推导内部筛选条件；同一对图片的综合分数不随门槛变化。**分数不是相同像素百分比或同源概率**。
+
+相似结果按图片对输出，附分数、完整路径、警告和本地并排预览（前12对）；其余完整清单保留在 CSV / JSON / Markdown。除严格像素核验的100分外，只称“疑似相似”，不能作为删除依据。颜色、透明度和宽高比也参与检查；低纹理图附加复核提示。
+
+首版相似模式只支持普通静态单帧图，不启用裁剪、局部复用、任意旋转或语义检索。动画、多页或不支持的图会记录错误，不偷偷拿第一帧比较。达到内部资源安全上限时返回1并标记不完整，不静默截断。完整算法、边界与报告说明见 [相似检测说明](references/similarity.md)。
+
+Windows 使用 .venv\Scripts\python.exe 执行相同参数。
+
 ### 常用参数
 
 | 参数 | 行为 |
 | --- | --- |
 | `--mode exact` | 默认，比较原始文件 SHA-256 |
 | `--mode pixels` | 比较完整解码像素，需要 Pillow |
+| `--mode similar` | 静态整图相似检测，需要 Pillow + NumPy |
+| `--similarity-threshold 90` | similar唯一算法调参项，0～100整数，默认90，日常80～95；越高越严 |
 | `--no-recursive` | 不扫描子文件夹 |
 | `--include-hidden` | 包含隐藏项，仍跳过符号链接 |
 | `--extensions jpg,jpeg,png` | 自定义扩展名集合，不区分大小写 |
@@ -140,9 +172,10 @@ G0001 | 3 个路径 | <SHA-256>
 
 | 报告 | 用途 |
 | --- | --- |
-| `duplicates.csv` | UTF-8 BOM，便于 Excel 打开；每个重复路径一行，包含组号、角色、指纹、字节数、完整路径及硬链接信息 |
+| `duplicates.csv` | UTF-8 BOM；exact/pixels每个重复路径一行；similar每个候选图片对一行，包含分数、门槛及两个完整路径 |
 | `duplicates.json` | 完整扫描范围、选项、统计、分组、跳过计数及错误；数据结构见 [报告格式](references/report-format.md) |
-| `duplicates.md` | 易读的完整重复分组与错误说明 |
+| `duplicates.md` | 易读的完整重复分组/相似图片对、警告与错误说明 |
+| `similarity-preview.png` | 仅similar有匹配时生成，展示前12对本地并排预览，完整清单不受预览上限限制 |
 
 ### 退出码
 
@@ -157,7 +190,7 @@ G0001 | 3 个路径 | <SHA-256>
 
 ## 判定边界与安全
 
-1. **exact 与 pixels 不是一回事。** 同一 PNG 添加说明信息后文件字节可能不同，但像素仍相同。重新保存的 JPEG 即使肉眼相似，也常因有损压缩产生像素差异。
+1. **exact、pixels 与 similar 不是一回事。** 同一 PNG 添加说明信息后文件字节可能不同，但像素仍相同。重新保存的 JPEG 即使肉眼相似，也常因有损压缩产生像素差异。
 2. pixels 对普通 8 位灰度、调色板、RGB、RGBA 图归一化到 RGBA。整数、浮点和 CMYK 等模式保留原模式和原始解码数据，跨这些模式不保证归为同组。
 3. pixels 不做 ICC 色彩管理转换；ICC 配置不同保守地视为不同。它比较的是本机 Pillow 解码结果，不是主观视觉相似度。
 4. 多通道 16 位 PNG、解码可能降低精度的高位深 TIFF，以及多分辨率 ICO 会被像素模式拒绝并记录错误，以免误报。科学图像、专有格式和未经验证的高位深解码器建议使用 exact。
@@ -171,12 +204,13 @@ G0001 | 3 个路径 | <SHA-256>
 ## 测试与开发
 
 ~~~bash
-# 完整测试（请先在虚拟环境安装可选依赖）
+# 完整测试：在虚拟环境安装全部可选图像依赖
+.venv/bin/python -m pip install -r requirements-similar.txt
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python -m compileall -q scripts tests
 ~~~
 
-没有 Pillow 时，标准库模式和安全测试仍可运行，但像素测试会显示跳过；这不算像素模式完成验证。完整测试覆盖字节/像素查重、EXIF、动画全部帧与时长、TIFF 全部页、ICC/高位深边界、损坏图片、权限错误、中文路径、隐藏项、硬链接/符号链接、报告一致性、文件变化和不覆盖原图。
+没有Pillow/NumPy时，对应图像专项会跳过，这不算完整验证。测试覆盖严格查重、相似变体、全部101个整数门槛的一致性、严格100、BK-tree与暴力搜索对照、SSIM公式、颜色/透明度、非传递关系、资源上限、EXIF、动画/多页边界、损坏图、权限错误、中文路径和原图只读。
 
 [GitHub Actions](.github/workflows/tests.yml) 配置了 Linux / macOS / Windows，以及 Python 3.10 / 3.12 / 3.14 的组合；实际执行状态见顶部徽章及 Actions 页面。本地验证记录见 [TESTING.md](TESTING.md)。
 
@@ -185,10 +219,15 @@ G0001 | 3 个路径 | <SHA-256>
 ~~~text
 image-duplicate-finder-skill/
 ├── SKILL.md                      # Agent 入口与安全执行流程
-├── scripts/find_duplicates.py    # 本地只读扫描器
-├── tests/test_find_duplicates.py # 使用临时合成图片的回归测试
-├── references/report-format.md  # 报告结构说明
-├── requirements-pixels.txt      # 可选 Pillow 依赖
+├── scripts/find_duplicates.py    # 统一只读命令行
+├── scripts/image_similarity.py   # 单门槛相似检测
+├── scripts/tool_adapter.py       # 带宿主路径白名单的JSON入口
+├── adapters/chat-completions-tools.json
+├── tests/                       # 临时合成样本与安全/契约回归
+├── references/similarity.md      # 单门槛、评分与检测范围
+├── references/report-format.md   # 两种报告结构
+├── requirements-pixels.txt       # 仅Pillow
+├── requirements-similar.txt      # Pillow + NumPy
 ├── .github/workflows/tests.yml  # 跨平台 CI
 ├── TESTING.md
 └── LICENSE
