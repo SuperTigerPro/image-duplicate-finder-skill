@@ -1,0 +1,6 @@
+#!/bin/sh
+# SSH stdio only. Runtime configuration and the interpreter remain private.
+set -eu
+SKILL_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PYTHON=${COPYNCE_PYTHON:-"$SKILL_DIR/.venv/bin/python"}
+exec "$PYTHON" "$SKILL_DIR/scripts/copynce_server.py"

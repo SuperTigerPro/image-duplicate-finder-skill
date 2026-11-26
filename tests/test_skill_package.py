@@ -7,7 +7,7 @@ from urllib.parse import unquote
 ROOT = Path(__file__).resolve().parents[1]
 DOCUMENTS = ("SKILL.md", "README.md", "TESTING.md", "references/report-format.md",
              "references/client-compatibility.md", "references/universal-agent-prompt.md",
-             "references/similarity.md")
+             "references/similarity.md", "references/copynce.md")
 REQUIRED = DOCUMENTS + (
     "scripts/find_duplicates.py", "tests/test_find_duplicates.py",
     "scripts/tool_adapter.py", "tests/test_tool_adapter.py", "adapters/chat-completions-tools.json",
@@ -42,7 +42,8 @@ class SkillPackageTests(unittest.TestCase):
         source = (ROOT / "scripts/find_duplicates.py").read_text(encoding="utf-8")
         version = re.search(r'^VERSION = "([^\"]+)"', source, re.MULTILINE).group(1)
         self.assertIn(f'  version: "{version}"', front)
-        self.assertLessEqual(len(values["compatibility"]), 500)
+        if "compatibility" in values:  # Optional; requirements may also be documented in the body.
+            self.assertLessEqual(len(values["compatibility"]), 500)
 
     def test_local_markdown_links_point_to_packaged_resources(self):
         for name in DOCUMENTS:

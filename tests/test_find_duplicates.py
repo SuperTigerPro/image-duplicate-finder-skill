@@ -376,6 +376,23 @@ class SafetyAndReportTests(Fixture):
         self.assertEqual(report["groups"], [])
         self.assertEqual(report["errors"][0]["error_type"], "ChangedFileError")
 
+    def test_replaced_parent_symlink_is_rejected_even_when_inode_matches(self):
+        parent = self.images / "selected"
+        parent.mkdir()
+        path = parent / "a.png"
+        path.write_bytes(png_bytes())
+        info = path.stat()
+        record = finder.ImageFile(path, info.st_size, finder.signature(info))
+        held = self.images / "original-directory"
+        parent.rename(held)
+        try:
+            parent.symlink_to(held, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("Directory symlinks unavailable")
+        with self.assertRaises((OSError, ValueError)):
+            with finder.checked_stream(record) as stream:
+                stream.read()
+
     def test_file_changed_after_hash_before_final_verification_rejected(self):
         first = self.write("a.png", b"same")
         self.write("b.png", b"same")

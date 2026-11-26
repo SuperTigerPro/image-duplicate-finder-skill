@@ -3,27 +3,28 @@
     "type": "function",
     "function": {
       "name": "find_image_duplicates",
-      "description": "Read-only local image duplicate and static-image similarity detection. Never delete, modify or upload images. A local host with authorized path roots must execute the adapter.",
+      "description": "Read-only image duplicate detection with optional local or SSH CopyNCE. The host must explicitly grant model use, bind private remote profiles, and separately authorize uploads. Never delete or modify original images; never accept credentials in tool arguments.",
       "parameters": {
         "type": "object",
         "properties": {
           "paths": {
             "type": "array",
-            "minItems": 1,
+            "minItems": 0,
             "items": {
               "type": "string",
               "minLength": 1
             },
-            "description": "Explicitly selected local directories or image files within host-authorized roots."
+            "description": "Selected local directories or image files within host-authorized roots. Empty ONLY for a host-authorized remote_directory query."
           },
           "mode": {
             "type": "string",
             "enum": [
               "exact",
               "pixels",
-              "similar"
+              "similar",
+              "copynce"
             ],
-            "description": "exact: raw SHA-256; pixels: full decoded pixels (Pillow); similar: static whole-image similarity (Pillow + NumPy)."
+            "description": "exact: raw SHA-256; pixels: decoded pixels; similar: static whole-image similarity; copynce: experimental whole-image and region copy candidates."
           },
           "output_dir": {
             "type": "string",
@@ -44,6 +45,34 @@
             "maximum": 100,
             "default": 90,
             "description": "Optional ONLY for similar mode: the single similarity control. Higher is stricter. Recommended 90, normal range 80–95, 100 requires strict full-resolution pixel equality. Not a probability."
+          },
+          "backend": {
+            "type": "string", "enum": ["local", "cloud"], "default": "local",
+            "description": "Only copynce. Cloud uses a host-bound private profile; it never authorizes upload by itself."
+          },
+          "model_threshold": {
+            "type": "number", "minimum": -1, "maximum": 1, "default": 0.75,
+            "description": "Only copynce. Raw cosine starting threshold requiring domain calibration; not a probability."
+          },
+          "whole_only": {
+            "type": "boolean", "default": false,
+            "description": "Only copynce. Compare whole images only; otherwise include fixed overlapping crop windows."
+          },
+          "search_mode": {
+            "type": "string", "enum": ["auto", "exact", "indexed"], "default": "auto",
+            "description": "Only copynce. Exact compares every selected feature pair; indexed may miss candidates."
+          },
+          "top_k": {
+            "type": "integer", "minimum": 1, "maximum": 20000, "default": 100,
+            "description": "Only copynce. Maximum returned image pairs; report states whether results were truncated."
+          },
+          "remote_profile": {
+            "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$",
+            "description": "Only cloud. An anonymous ID explicitly bound by the host; never an address, username, password or key path."
+          },
+          "remote_directory": {
+            "type": "string", "minLength": 1,
+            "description": "Only cloud with empty paths. Must be inside the current host-authorized remote root."
           }
         },
         "required": [

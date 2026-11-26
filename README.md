@@ -3,9 +3,9 @@
 [![Tests](https://github.com/SuperTigerPro/image-duplicate-finder-skill/actions/workflows/tests.yml/badge.svg)](https://github.com/SuperTigerPro/image-duplicate-finder-skill/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**在本地文件夹中查找完全重复与疑似相似图片。相似检测只调一个0～100门槛，默认90。只读，不删图，不上传。**
+**查找完全重复、整图相似和跨图片的局部复用。可选普通查重、本地 CopyNCE 模型或自有服务器上的模型。原始图片始终只读。**
 
-这是一个遵循 [Agent Skills](https://agentskills.io/specification) 目录规范的可复用 Skill，也可作为独立 Python 命令行工具使用。无需网站账号、API Key 或云端识图服务。
+这是一个遵循 [Agent Skills](https://agentskills.io/specification) 目录规范的可复用 Skill，也可作为独立 Python 命令行工具使用。普通模式无需模型；模型模式可本地运行，也可以经 SSH 调用自己的服务器。
 
 ## 能做什么
 
@@ -19,17 +19,27 @@
 
 - **similar（新增）**：静态整图相似检测，覆盖常见缩放、重新压缩和轻微亮度变化，用户只调相似度门槛，内部指标自动联动。
 
-**不做**人脸聚类、裁剪/局部复用、任意旋转、语义检索或自动删除。相似候选与完全重复分开呈现。
+- **copynce**：使用官方 Descriptor 权重比较整图与重叠的局部裁块，输出疑似复用图对、余弦分数及两侧候选窗口，供人工核对。
+
+### 怎么选
+
+| 需要做什么 | 选择 | 示例 |
+| --- | --- | --- |
+| 找严格重复，或检查整图缩放、重压缩 | 普通查重 | “找出目录下文件内容完全相同的图片。” |
+| 在本机排查裁剪、拼接、嵌套 | 本地模型查重 | “用本地模型核查这批图，标出疑似复用区域。” |
+| 使用服务器上的图库或算力 | 云端模型查重 | “用服务器模型检查服务器上已有的这个图库。” |
+
+只说“帮我查重”时，Agent 会展示这三个选择。需求明确时直接执行。云端只连接用户指定的服务器；本地图片须有本次授权才会发往目标服务器。见[模型操作指南](references/copynce.md)。
 
 ## 跨模型与客户端
 
-扫描器不绑定任何模型、模型 SDK 或 API Key。除了标准 Skill，还提供 [通用 Agent / 自定义 GPT 提示词](references/universal-agent-prompt.md)、[客户端兼容说明](references/client-compatibility.md) 及 [Chat Completions 函数工具定义](adapters/chat-completions-tools.json)。
+可使用不同语言模型驱动 Agent，查重脚本无需聊天模型 API Key。除了标准 Skill，还提供 [通用 Agent / 自定义 GPT 提示词](references/universal-agent-prompt.md)、[客户端兼容说明](references/client-compatibility.md) 及 [Chat Completions 函数工具定义](adapters/chat-completions-tools.json)。
 
 - 支持 Skill 和本地执行的 Agent（包括 DeepSeek Harness 等）可直接调用。
 - GPT / DeepSeek 等模型的本地 Agent 宿主可通过 JSON 适配器接入，输入与输出目录由宿主白名单限制。
 - 普通 ChatGPT / 自定义 GPT / DeepSeek 聊天如果没有本地文件工具，只能提供本机运行指引并解释结果，不能声称直接读到了硬盘。GPT Actions 需要 OpenAPI 桥接，工具 JSON 不能直接导入 Actions。
 
-详细条件和示例见 [兼容矩阵与接入文档](references/client-compatibility.md)。图片无需发送给模型；报告中的本地路径也应按用户隐私偏好脱敏。
+详细条件和示例见 [兼容矩阵与接入文档](references/client-compatibility.md)。图片无需发送给聊天模型；报告中的本地路径也应按用户隐私偏好脱敏。
 
 ## 作为 Skill 安装
 
@@ -124,9 +134,21 @@ python3 -m venv .venv
 
 相似结果按图片对输出，附分数、完整路径、警告和本地并排预览（前12对）；其余完整清单保留在 CSV / JSON / Markdown。除严格像素核验的100分外，只称“疑似相似”，不能作为删除依据。颜色、透明度和宽高比也参与检查；低纹理图附加复核提示。
 
-首版相似模式只支持普通静态单帧图，不启用裁剪、局部复用、任意旋转或语义检索。动画、多页或不支持的图会记录错误，不偷偷拿第一帧比较。达到内部资源安全上限时返回1并标记不完整，不静默截断。完整算法、边界与报告说明见 [相似检测说明](references/similarity.md)。
+普通 similar 模式只支持普通静态单帧图，不启用裁剪、局部复用、任意旋转或语义检索。动画、多页或不支持的图会记录错误，不偷偷拿第一帧比较。达到内部资源安全上限时返回1并标记不完整，不静默截断。完整算法、边界与报告说明见 [相似检测说明](references/similarity.md)。
 
 Windows 使用 .venv\Scripts\python.exe 执行相同参数。
+
+### 5. 模型查重
+
+~~~bash
+python3 scripts/find_duplicates.py "/选定图库" --mode copynce --backend local --output-dir "/可写位置/模型报告"
+~~~
+
+首次运行会自动寻找兼容 Python，在用户缓存目录创建隔离环境，从官方来源下载并校验权重。CPU、CUDA 和 Apple Silicon MPS 共用约 87.5 MB 的同一份权重；依赖另占空间。实际推理自检后选择设备，显存不足先减小批量，再回退本机 CPU，不改系统驱动，也不自动切换云端。
+
+默认比较整图和固定局部裁块，`--whole-only` 只比较整图。**CopyNCE 是实验性候选筛查**；`--threshold 0.75` 是需要领域校准的起始余弦门槛，不是75%的重复概率。高分和候选窗口不能替代严格重复核验或人工来源审查。官方公开基础权重的范围及局限见 [CopyNCE 上游说明](https://github.com/eddielyc/CopyNCE#fine-tuning)。
+
+模型报告强制写在仓库及所有 Git 工作树之外。`--summary-only` 只向终端输出统计，完整路径保留在私有报告。本机离线、服务器部署、严格图库边界、默认去元数据传输、取消与重连清理见[模型操作指南](references/copynce.md)。
 
 ### 常用参数
 
@@ -135,6 +157,7 @@ Windows 使用 .venv\Scripts\python.exe 执行相同参数。
 | `--mode exact` | 默认，比较原始文件 SHA-256 |
 | `--mode pixels` | 比较完整解码像素，需要 Pillow |
 | `--mode similar` | 静态整图相似检测，需要 Pillow + NumPy |
+| `--mode copynce` | 通过 `--backend local` 或 `--backend cloud` 指定模型运行位置 |
 | `--similarity-threshold 90` | similar唯一算法调参项，0～100整数，默认90，日常80～95；越高越严 |
 | `--no-recursive` | 不扫描子文件夹 |
 | `--include-hidden` | 包含隐藏项，仍跳过符号链接 |
@@ -172,10 +195,10 @@ G0001 | 3 个路径 | <SHA-256>
 
 | 报告 | 用途 |
 | --- | --- |
-| `duplicates.csv` | UTF-8 BOM；exact/pixels每个重复路径一行；similar每个候选图片对一行，包含分数、门槛及两个完整路径 |
+| `duplicates.csv` | UTF-8 BOM；exact/pixels每个重复路径一行；similar 和 copynce 每个候选图片对一行，包含分数、门槛及两个完整路径 |
 | `duplicates.json` | 完整扫描范围、选项、统计、分组、跳过计数及错误；数据结构见 [报告格式](references/report-format.md) |
 | `duplicates.md` | 易读的完整重复分组/相似图片对、警告与错误说明 |
-| `similarity-preview.png` | 仅similar有匹配时生成，展示前12对本地并排预览，完整清单不受预览上限限制 |
+| `similarity-preview.png` | 原图在本地可读时展示前 12 对预览；模型模式带候选区域框，宿主缺少 Pillow 时可生成 HTML 预览 |
 
 ### 退出码
 
@@ -188,6 +211,8 @@ G0001 | 3 个路径 | <SHA-256>
 
 自动化调用必须检查退出码及 JSON 中的 `complete` / `errors`，不能只看有没有分组。这里的“完整”以记录的扫描范围为准，不是文件系统快照。
 
+模型模式还需分别核对 `files_complete`、`exhaustive`、`truncated`：退出0只表示文件处理成功，近似检索或 top-k 截断仍可能省略候选。只有 `all_matches_reported=true` 才是本次固定窗口和阈值下的完整返回清单。
+
 ## 判定边界与安全
 
 1. **exact、pixels 与 similar 不是一回事。** 同一 PNG 添加说明信息后文件字节可能不同，但像素仍相同。重新保存的 JPEG 即使肉眼相似，也常因有损压缩产生像素差异。
@@ -198,13 +223,13 @@ G0001 | 3 个路径 | <SHA-256>
 6. HEIC / HEIF、RAW、SVG、JXL 等是否支持像素解码取决于 Pillow 和已安装的解码器；本项目不会自动安装插件，也不会静默忽略解码失败。精确字节模式不受解码器限制。
 7. 隐藏项默认跳过；显式选定的隐藏根目录/文件不受该项过滤。符号链接始终不跟随；直接传入符号链接会报参数错误。重复/重叠输入路径只计算一次，硬链接的不同路径仍会列出。
 8. 检查文件的设备、inode、大小及修改/变更时间，尽量发现扫描过程中的修改。它不是事务型快照；请暂停图库同步或编辑后扫描。
-9. 脚本只创建新的报告目录，不写原图。操作系统可能因读取而更新访问时间（atime）。如果磁盘写满，输出可能不完整；修复后用新目录重试。
-10. **不会上传图片。** 报告包含本地完整路径，也属于可能敏感的信息。不要未经许可将原图或报告提交到 GitHub；本仓库的测试只使用临时生成的合成图。
+9. 报告只写入新目录，模型模式另有环境、权重和特征缓存。操作系统可能因读取而更新访问时间（atime）。如果磁盘写满，输出可能不完整；修复后用新目录重试。
+10. 普通查重和本地模型均在本机运行。云端上传须明确目的服务器和授权范围。真实连接配置、图片、报告、预览、缓存及日志均禁止提交到 GitHub。
 
 ## 测试与开发
 
 ~~~bash
-# 完整测试：在虚拟环境安装全部可选图像依赖
+# 普通图像模式（模型/stdio专项依赖缺失时会明确跳过）
 .venv/bin/python -m pip install -r requirements-similar.txt
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python -m compileall -q scripts tests
@@ -214,6 +239,22 @@ G0001 | 3 个路径 | <SHA-256>
 
 [GitHub Actions](.github/workflows/tests.yml) 配置了 Linux / macOS / Windows，以及 Python 3.10 / 3.12 / 3.14 的组合；实际执行状态见顶部徽章及 Actions 页面。本地验证记录见 [TESTING.md](TESTING.md)。
 
+完整模型回归使用独立的 Python 3.11 环境，安装 [requirements-copynce.txt](requirements-copynce.txt)、`mcp>=1.20,<2` 和可选的 `faiss-cpu`。CI 的模型专项不下载权重、不连接真实服务器，不需要服务器资料或 Actions secrets。
+
+### 公开提交与打包
+
+Git 克隆不会自动启用 hooks。维护者可在自己的开发副本运行 `git config --local core.hooksPath .githooks`；有既有 hooks 时先合并检查流程。可将本机敏感标识逐行保存在仓库外私有文件，用 `IMAGE_SKILL_PRIVATE_TERMS_FILE` 引用；禁止将该文件或真实配置加入源码。
+
+检查器对未知文件、敏感地址/凭据/私有路径及缺失必要资源拒绝放行，错误不回显敏感值。提交前用 `--staged`，推送钩子检查全部待推送提交及标签消息，不能只检查当前工作树。开发副本可以先生成经过检查的审阅包：
+
+~~~bash
+python3 scripts/check_public_files.py --working-tree
+python3 scripts/check_public_files.py --working-tree --write-archive "/path/to/private-output/skill.zip"
+python3 scripts/check_public_files.py --working-tree --archive "/path/to/private-output/skill.zip"
+~~~
+
+正式提交后可用 `--commit HEAD` 替换 `--working-tree`。打包只包含源码白名单，复核要求ZIP与对应源码逐字节一致。真实IP、登录用户名、口令、密钥、profile、图库、缓存、报告和日志均不得进入 GitHub、Actions、Issue、PR或发布附件。正常查重流程不执行 Git 提交或上传；`.gitignore`和GitHub秘密扫描只是补充防护。
+
 ## 目录
 
 ~~~text
@@ -222,12 +263,18 @@ image-duplicate-finder-skill/
 ├── scripts/find_duplicates.py    # 统一只读命令行
 ├── scripts/image_similarity.py   # 单门槛相似检测
 ├── scripts/tool_adapter.py       # 带宿主路径白名单的JSON入口
+├── scripts/copynce_*.py          # 准备、推理、检索、报告、SSH与隔离任务
+├── scripts/check_public_files.py # 源码/历史/ZIP防泄漏检查与白名单打包
+├── start-mcp                    # SSH stdio服务，无公网监听
+├── agents/openai.yaml           # Skill界面元数据
 ├── adapters/chat-completions-tools.json
 ├── tests/                       # 临时合成样本与安全/契约回归
 ├── references/similarity.md      # 单门槛、评分与检测范围
-├── references/report-format.md   # 两种报告结构
+├── references/copynce.md         # 本地和云端模型指南
+├── references/report-format.md   # 三种报告结构
 ├── requirements-pixels.txt       # 仅Pillow
 ├── requirements-similar.txt      # Pillow + NumPy
+├── requirements-copynce.txt      # 固定的最小推理依赖
 ├── .github/workflows/tests.yml  # 跨平台 CI
 ├── TESTING.md
 └── LICENSE
@@ -235,4 +282,4 @@ image-duplicate-finder-skill/
 
 ## 许可证
 
-[MIT](LICENSE)。
+原有代码使用 [MIT](LICENSE)。CopyNCE 移植代码保留 [Apache-2.0 许可](third_party/CopyNCE-LICENSE)与来源署名；权重从[作者发布页](https://github.com/eddielyc/CopyNCE#models)获取，不随 Skill 包重新上传。

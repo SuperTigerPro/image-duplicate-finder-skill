@@ -1,0 +1,6 @@
+# Portable CopyNCE inference only; no training or CUDA-specific packages here.
+# The bootstrap selects the matching official CUDA/CPU index when necessary.
+# Intel macOS uses the isolated legacy torch 2.2.2 / numpy 1.26.4 profile instead.
+torch==2.7.1
+numpy==2.2.6
+Pillow==11.3.0

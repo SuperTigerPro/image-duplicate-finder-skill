@@ -1,70 +1,126 @@
 # 客户端、模型与工具接入
 
-## 兼容原则
+## 权限与执行宿主
 
-本项目的图像比对逻辑是纯本地 Python，不依赖 GPT、DeepSeek 或其他模型 SDK。模型负责理解意图和展示结果，宿主负责文件权限与执行。根目录的 [SKILL.md](../SKILL.md) 提供标准 Agent Skills 入口；无该规范支持时使用 [通用提示词](universal-agent-prompt.md)。
+聊天模型理解意图，执行宿主管理路径、认证和进程。普通查重与本机 CopyNCE 在用户机器上运行；云端模型通过 SSH stdio 调用用户指定的服务器。根目录的 [SKILL.md](../SKILL.md) 是标准 Agent Skills 入口；其他宿主可使用 [通用提示词](universal-agent-prompt.md)。读取说明文件本身不会获得本机硬盘权限。
 
-**模型兼容不等于客户端天然有本地硬盘权限。** 不同客户端能力不同，不能承诺普通聊天窗口导入说明后就可以直接扫描电脑。
-
-| 环境 | 接入方式 | 能否自动扫描本地目录 |
+| 环境 | 接入方式 | 本机目录访问 |
 | --- | --- | --- |
-| 支持标准 Agent Skills 且有本地 Python 工具的宿主 | 导入整个仓库 | 可以，在用户/宿主授权范围内 |
-| DeepSeek Harness 等本地 Agent 宿主 | 导入 Skill，使用宿主文件/命令工具 | 可以；取决于宿主权限，不依赖具体模型 |
-| GPT / DeepSeek / 其他 OpenAI-compatible Chat Completions 模型的自建 Agent | 注册函数定义，由本地宿主执行 JSON 适配器 | 可以；模型本身不会读盘 |
-| ChatGPT 客户端或自定义 GPT，已经接入合适的本地执行工具 | 使用通用提示词，并由实际工具桥接本地脚本 | 有条件可以；本项目不假定或自动配置该桥接 |
-| ChatGPT / GPT / DeepSeek 普通聊天，没有本地工具 | 粘贴通用提示词；让助手生成本地命令，用户执行后反馈脱敏结果 | 需要用户在本机执行，不能假装已自动扫描 |
-| 只有云端代码解释器的聊天环境 | 不是本地电脑；默认不把图库上传到云端 | 不支持直接访问本地路径 |
+| 支持 Agent Skills，且有本地 Python 工具的宿主 | 导入完整仓库，使用宿主执行工具 | 受用户和宿主授权范围约束 |
+| 自建本地 Agent，使用兼容 Chat Completions 的函数工具 | 注册本项目工具定义，由宿主运行适配器 | 模型不直接读盘，宿主执行 |
+| 已有合适本地执行桥接的聊天客户端 | 使用通用提示词及实际桥接工具 | 以该客户端实际工具能力为准 |
+| 没有本地工具的普通聊天 | 生成本机命令，由用户运行并反馈必要统计 | 助手不能直接扫描用户电脑 |
+| 仅有云端代码执行环境 | 与用户电脑分离 | 不把本地路径当成云端已挂载目录 |
 
-无需访问任何模型 API 即可运行命令行、适配器和全部测试。没有声称已在每一种商业客户端上完成账号级集成测试；可验证的内容是标准文件结构、JSON 工具契约、本地适配器以及跨平台执行。
+命令行和适配器不需要聊天模型 API Key；模型查重使用本机或自有服务器上的视觉模型。未声称已完成每种商业客户端的账号级集成验证。
 
-## 通用函数工具入口
+## JSON 函数适配器
 
-[函数定义](../adapters/chat-completions-tools.json) 使用兼容 Chat Completions 的 tools/function 格式，可由支持此格式的 OpenAI / DeepSeek 等 Agent 宿主加载。OpenAI Responses API、GPT Actions 或专有工具协议须由宿主转换成对应格式；不能将这份 JSON 直接当作 OpenAPI 或 MCP 服务。
+[函数定义](../adapters/chat-completions-tools.json) 使用 Chat Completions 的 `tools/function` 结构。其他工具协议需要宿主转换，不能直接作为 OpenAPI 或 MCP 配置导入。
 
-模型输出的函数 arguments 由宿主交给 [tool_adapter.py](../scripts/tool_adapter.py) 的 stdin。适配器不启动服务、不调用模型、不执行任意 shell 命令。宿主启动时必须指定输入白名单和报告根目录，模型参数不能扩大它们。
-
-示例参数（只作演示；使用前替换为获准路径）：
+宿主把函数 arguments 作为 stdin 交给 [tool_adapter.py](../scripts/tool_adapter.py)。必须由宿主先设置扫描白名单和报告根目录，模型参数不能扩大权限。以下均为占位路径，报告根目录应在所有 Git 工作树之外，每次 `output_dir` 使用其中尚不存在的新子目录。
 
 ~~~json
 {
-  "paths": ["/data/用户选定的图片"],
+  "paths": ["/path/to/selected-gallery"],
   "mode": "exact",
-  "output_dir": "/work/reports/run-001",
+  "output_dir": "/path/to/private-reports/exact-001",
   "recursive": true,
   "include_hidden": false
 }
 ~~~
-
-本地宿主启动示例：
 
 ~~~bash
 python3 scripts/tool_adapter.py \
-  --allow-root "/data/用户选定的图片" \
-  --report-root "/work/reports" < arguments.json
+  --allow-root "/path/to/selected-gallery" \
+  --report-root "/path/to/private-reports" < arguments.json
 ~~~
 
-不要让模型自行决定 --allow-root 为整个磁盘。用户选择变化时，由宿主重新取得用户授权并更新启动参数。白名单是额外校验，不是操作系统沙箱，仍应使用宿主的最小权限执行策略；遇到拒绝不可绕过。
+`--allow-root` 可重复，只填用户明确选择的目录或文件，不能由模型自行设为整个磁盘。用户改变范围时由宿主更新授权。白名单是附加校验，不是操作系统沙箱；权限拒绝时不绕过限制。宿主应使用参数数组启动进程，不把 JSON 或路径拼进 shell 代码。
 
-### 相似检测的可选单一参数
+## 普通相似检测
 
-mode 可取 exact、pixels、similar。旧的五个必填字段保持不变；仅similar允许额外的 similarity_threshold 整数字段，0～100，默认90。不能在exact/pixels里传入并被静默忽略，也不能传入字符串、布尔或小数。
+`mode` 为 `exact`、`pixels`、`similar` 时，不接受模型专用字段。五个必填字段始终是 `paths`、`mode`、`output_dir`、`recursive`、`include_hidden`。仅 `similar` 可增加 `similarity_threshold`，要求 0～100 整数，默认 90：
 
 ~~~json
 {
-  "paths": ["/data/用户选定的图片"],
+  "paths": ["/path/to/selected-gallery"],
   "mode": "similar",
   "similarity_threshold": 90,
-  "output_dir": "/work/reports/similar-001",
+  "output_dir": "/path/to/private-reports/similar-001",
   "recursive": true,
   "include_hidden": false
 }
 ~~~
 
-用户未提门槛就直接用90，不追问内部算法指标。较低值更宽松、较高值更严；100严格核验原始解码像素。相似报告schema_version=2，要读取similar_pairs而不是空groups；preview指向报告目录中的本地缩略预览。不要自动将预览或完整路径发送给云端模型。环境另需 [相似依赖](../requirements-similar.txt)，逻辑和限制见 [相似检测说明](similarity.md)。
+用户未给门槛就使用 90，不追问内部算法参数。100 需要完整分辨率严格像素核验。报告 `schema_version=2`，读取 `similar_pairs`，不能从空 `groups` 推断无相似图片。预览为本地文件，不自动发送给聊天模型。依赖及边界见 [相似检测说明](similarity.md)。
 
-### 返回值
+## 模型查重的宿主授权
 
-在宿主启动参数有效时，stdout 是一个 JSON 对象，不混入面向人类的日志。进程退出码与 exit_code 一致：
+`mode="copynce"` 必须由宿主启动时显式加 `--allow-model`，该授权包含准备必要环境和权重。模型参数不能自行开启它；需要离线限制时由宿主再加 `--model-offline`。
+
+~~~bash
+python3 scripts/tool_adapter.py \
+  --allow-root "/path/to/selected-gallery" --report-root "/path/to/private-reports" \
+  --allow-model < model-arguments.json
+~~~
+
+模型可提供以下字段，其余未知字段被拒绝：
+
+| 字段 | 含义 |
+| --- | --- |
+| `backend` | `local` 或 `cloud`，默认 `local` |
+| `model_threshold` | 原始余弦阈值 −1 至 1，默认 0.75；对应 CLI `--threshold`，不等于重复概率 |
+| `whole_only` | 布尔，默认 `false`；对应 CLI `--whole-only` |
+| `search_mode` | `auto`、`exact` 或 `indexed`；近似索引可能漏检 |
+| `top_k` | 返回图对上限，1～20000，默认 100 |
+| `remote_profile` | 仅 cloud，宿主已绑定的匿名 ID，不是服务器地址或配置文件路径 |
+| `remote_directory` | 仅 cloud 且 `paths=[]`，必须在宿主授权的远端范围内 |
+
+`similarity_threshold` 仅用于普通 similar；copynce 使用 `model_threshold`。所有模型请求仍包含五个必填字段。`local` 不接受 `remote_profile` 或 `remote_directory`。
+
+### 查询既有远端图库
+
+真实 SSH 配置由宿主在本机仓库外保存，再以 `--remote-profile ID=FILE` 绑定匿名 ID。远端白名单使用 `--allow-remote-root ID=DIR`，可重复；这两个参数和 `--allow-model` 都是宿主启动参数，不能来自模型生成的工具 JSON。相对目录以服务器第一个 `image_roots` 为基准；使用相对图库名可减少在工具参数中暴露完整服务器路径。
+
+~~~bash
+python3 scripts/tool_adapter.py \
+  --allow-root "/path/to/approved-empty-local-root" \
+  --report-root "/path/to/private-reports" --allow-model \
+  --remote-profile "cloud1=/path/to/private-config/profile.json" \
+  --allow-remote-root "cloud1=subset" < remote-arguments.json
+~~~
+
+当前宿主入口保留必填的本机 `--allow-root`，可指定预先存在的狭窄空目录；下面远端请求的 `paths=[]`，不会扫描该本机目录。
+
+~~~json
+{
+  "paths": [],
+  "mode": "copynce",
+  "backend": "cloud",
+  "remote_profile": "cloud1",
+  "remote_directory": "subset/selected",
+  "model_threshold": 0.75,
+  "whole_only": false,
+  "search_mode": "auto",
+  "top_k": 100,
+  "output_dir": "/path/to/private-reports/remote-001",
+  "recursive": true,
+  "include_hidden": false
+}
+~~~
+
+远端查询要求 `include_hidden=false`，拒绝本机路径与远端目录混用。宿主白名单与服务器严格 `image_roots` 都必须通过；客户端默认拒绝未声明严格图库边界的服务。真实 IP、账号、密码、认证口令、密钥及 profile 路径都不能进入模型生成的工具参数。
+
+### 本机图片发送至服务器
+
+用户已授权本次选定图片传往指定服务器时，由宿主增加 `--allow-upload`，同时设置本机 `--allow-root` 和匿名 profile 绑定。工具 JSON 填本机 `paths`、`backend="cloud"`、`remote_profile`，省略 `remote_directory`。模型不能通过增加 JSON 字段授予上传权限；选择 cloud 本身也不构成上传授权。
+
+适配器上传使用默认去元数据推理副本：Pillow 完整解码、EXIF 转向、8 位 RGB PNG，不包含 EXIF、ICC 或文本元数据；缺 Pillow 时失败，不会自动传原字节。可见图片内容仍可能敏感。适配器不提供模型参数来选择原文件上传；需要发送包含元数据的原字节时，应由本机宿主在用户明确授权后使用 CLI `--upload-original`。部署、预检和断线清理见 [CopyNCE 指南](copynce.md)。
+
+## 返回值和隐私
+
+宿主启动参数有效时，stdout 仅含一个 JSON 对象；过程日志位于对象内，退出码与 `exit_code` 一致：
 
 ~~~json
 {
@@ -76,15 +132,10 @@ mode 可取 exact、pixels、similar。旧的五个必填字段保持不变；�
 }
 ~~~
 
-上例 report 简化了字段，完整格式见 [报告格式](report-format.md)。退出码 1 时仍返回部分 report，ok 为 false；2 时 report 为 null，不能把已有报告当作本次结果；130 表示中断。非法/超出 1 MiB 的请求、未知字段、错误类型和越界路径会被拒绝。
+示例的 report 已简化；完整字段见 [报告格式](report-format.md)。退出码 1 仍可有部分 report，`ok=false`；2 时 `report=null`，不能复用旧报告冒充新结果；130 表示中断。未知字段、错误类型、超过 1 MiB 的 JSON 和越界路径会被拒绝。
 
-宿主应使用参数数组启动进程，不能把模型 arguments 拼成 shell 字符串。读取 JSON 后再按其 SDK 将结果回传模型。报告含本地路径，是否将完整路径发送给云端模型由用户和宿主的隐私策略决定；可以只回传统计及经用户认可的脱敏清单。图片字节始终不需要发送给模型。
+copynce 返回 `schema_version=3` 的 `matches`、`complete`、`exhaustive` 和 `truncated`。适配器为模型 CLI 启用 `--summary-only`，但仍会读取完整私有报告并放进返回对象：**这不是自动脱敏返回。** 宿主必须在把结果交给云端聊天模型前按用户隐私偏好筛选，只回传必要统计或获准清单；完整路径和图片不应自动外发。报告不写连接 profile 中的地址或认证字段，图片完整路径仍可能包含账号名等隐私。含路径的报告、日志、配置、图片和特征均严禁发布到 GitHub。
 
-## ChatGPT / 自定义 GPT 的最小使用方法
+## 没有本机工具时
 
-1. 复制 [通用提示词](universal-agent-prompt.md) 到 Instructions 或对话中，并提供项目仓库链接。
-2. 如果宿主确有本地执行工具，明确授权扫描根目录及新报告位置，再调用本地脚本/适配器。
-3. 没有该工具时，让助手生成本机命令，在本机运行；只反馈必要统计或脱敏报告。
-4. 不要把“上传源代码文件到 GPT Knowledge”误认为能授予读取本地文件夹的权限。
-
-这种分层方式让同一套扫描器适配不同模型，同时不虚构任何客户端的权限或集成能力。
+可以采用 [通用提示词](universal-agent-prompt.md)，由助手提供本机命令，用户在自己电脑执行后反馈统计或脱敏报告。将说明上传到知识库不会授予本机目录权限；只有云端执行环境时，也不能假装已读取用户电脑。

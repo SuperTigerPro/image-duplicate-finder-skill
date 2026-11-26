@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+python_cmd=$(command -v python3 || command -v python)
+exec "$python_cmd" scripts/check_public_files.py --staged

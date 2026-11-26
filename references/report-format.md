@@ -1,6 +1,6 @@
 # 报告格式
 
-exact / pixels 保持 schema_version=1。similar 使用 schema_version=2，按图片对报告，见文末“相似模式”。下面先说明原有严格查重结构。
+exact / pixels 保持 schema_version=1。similar 使用 schema_version=2，按图片对报告，见文末“相似模式”。copynce 使用 schema_version=3。下面先说明原有严格查重结构。
 
 脚本在一个**新目录**中输出以下三种报告；已有目录拒绝覆盖。报告不嵌入图片内容，但含完整路径，分享前注意隐私。
 
@@ -141,3 +141,22 @@ pair_id,similarity_score,threshold,pixel_identical,path_a,path_b,size_a_bytes,si
 每个图片对一行；一个图片路径可能出现在多个图片对中，不能把行数当图片数。CSV仍为UTF-8 BOM，路径按标准CSV引用。Markdown为逐对分数/路径/警告，并引用有结果时生成的 similarity-preview.png。不要把预览包含的对数当总结果数。
 
 相似模式的安全上限、动画/多页/特殊模式不支持、损坏图和文件变化会记录 errors，complete=false，进程退出1。部分结果不适合做全目录阈值召回比较。原图不会被删除或修改。
+
+## 模型模式（schema_version = 3）
+
+`mode="copynce"` 时读取 `matches`。每对含 `path_a`、`path_b`、`score`、`size_a`、`size_b`、`box_a`、`box_b`。分数为原始余弦。区域以经过 EXIF 方向校正的原图像素计，格式为 `[x0, y0, x1, y1)`，右/下边界除外。区域框对应参与匹配的窗口，精确复用边界需要回图核实。
+
+| 字段 | 用法 |
+| --- | --- |
+| `files_complete`、`complete`、`errors` | 前两者同义，表示所选文件是否成功处理。坏图等会记录错误；仍可交付部分结果。 |
+| `exhaustive` | 检索是否覆盖全部成功处理的图对。近似检索可能遗漏候选。 |
+| `truncated` | 达到门槛的候选数量是否超过返回上限。 |
+| `all_matches_reported` | 成功处理、覆盖所有图对且未截断时为真。 |
+| `model_id`、`weights_sha256`、`pipeline`、`precision` | 模型、权重、预处理/裁块版本及数值精度；缓存也按权重、预处理、裁块及文件内容和状态区分。 |
+| `summary.cache_hits`、`summary.cache_misses` | 本次复用和新提取特征的成功图片数。 |
+| `safety_limits` | 内部图片10000、特征窗口100000、返回图对20000上限。超过输入/特征上限保留部分结果并标记文件处理不完整，不静默宣称扫描全部完成。 |
+| `match_type` | 每个matches条目中的whole-whole、whole-region或region-region；描述命中窗口组合，不能据局部命中判整图相同。 |
+
+近似检索或设置返回上限的任务可以正常退出 0。仅当 `all_matches_reported` 为真时才称为“本次范围与阈值下的完整候选清单”。本机原图可读时，PNG 预览最多展示 12 对并绘制匹配框；宿主缺少 Pillow 时可使用 HTML 预览。服务器已有图库只返回路径与区域，无需下载原图。CSV、JSON、Markdown 记录本次返回的完整图对清单。
+
+模型余弦分数范围为-1至1，不是概率，不与similar模式0～100分混用。完整精确检索只覆盖当前生成的整图和固定裁块，不承诺任意裁剪或单图内部克隆的召回。模型报告拒绝保存在Skill目录或任何Git工作树；云端终端输出统计，完整私有报告含原图路径，禁止公开上传。临时传图结果映射回本机原始路径，不保留远端任务配置和服务器错误原文。

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 CHUNK_SIZE = 1024 * 1024
 DEFAULT_EXTENSIONS = (
     ".jpg", ".jpeg", ".jfif", ".png", ".apng", ".gif", ".webp", ".bmp",
@@ -56,6 +56,19 @@ class ChangedFileError(OSError):
     pass
 
 
+def canonical_input(value):
+    """Resolve an explicit input without following user-created symbolic links."""
+    path = Path(value).expanduser().absolute()
+    if sys.platform == "darwin" and path.parts[1:2] in (("tmp",), ("var",)):
+        alias = Path("/", path.parts[1])
+        private = Path("/private", path.parts[1])
+        if alias.is_symlink() and alias.resolve() == private:
+            path = private.joinpath(*path.parts[2:])
+    if any(item.is_symlink() for item in (path, *path.parents)):
+        raise ValueError("不接受经过符号链接的输入，请使用实际路径")
+    return path.resolve(strict=True)
+
+
 def assert_unchanged(record, info):
     if not stat.S_ISREG(info.st_mode) or signature(info) != record.stamp:
         raise ChangedFileError("文件在扫描期间发生变化，请停止修改后重新扫描")
@@ -63,9 +76,27 @@ def assert_unchanged(record, info):
 
 @contextmanager
 def checked_stream(record):
-    """Open read-only, reject final-component symlinks where the OS supports it."""
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(record.path, flags)
+    """Pin POSIX parent directories and reject symlinks at every component."""
+    flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    path = record.path.absolute()
+    parents = []
+    if os.open in os.supports_dir_fd and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"):
+        try:
+            parent = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+            parents.append(parent)
+            for component in path.parts[1:-1]:
+                parent = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                parents.append(parent)
+            fd = os.open(path.name, flags, dir_fd=parent)
+        except BaseException:
+            for handle in reversed(parents):
+                os.close(handle)
+            raise
+    else:
+        if any(item.is_symlink() for item in (path, *path.parents)):
+            raise ChangedFileError("输入路径经过符号链接，请使用实际路径")
+        fd = os.open(path, flags)
     try:
         assert_unchanged(record, os.stat(record.path, follow_symlinks=False))
         opened = os.fstat(fd)
@@ -81,6 +112,8 @@ def checked_stream(record):
         assert_unchanged(record, os.stat(record.path, follow_symlinks=False))
     finally:
         os.close(fd)
+        for handle in reversed(parents):
+            os.close(handle)
 
 
 def exact_digest(stream):
@@ -449,11 +482,22 @@ def main(argv=None):
     for output in (sys.stdout, sys.stderr):
         if output is not None and hasattr(output, "reconfigure"):
             output.reconfigure(encoding="utf-8", errors="backslashreplace")
-    parser = argparse.ArgumentParser(description="本地图片查重与相似检测：只读扫描，不删除原图。")
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    route = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    route.add_argument("--mode", choices=("exact", "pixels", "similar", "copynce"), default="exact")
+    selected, remaining = route.parse_known_args(arguments)
+    if selected.mode == "copynce":
+        if __package__:
+            from . import copynce_cli
+        else:
+            import copynce_cli
+        return copynce_cli.main(remaining)
+    parser = argparse.ArgumentParser(description="图片查重与相似检测：只读原图。模型选项见 --mode copynce --help。",
+                                     allow_abbrev=False)
     parser.add_argument("paths", nargs="+", help="一个或多个本地文件夹/图片路径（含空格时加引号）")
     parser.add_argument("--version", action="version", version=VERSION)
-    parser.add_argument("--mode", choices=("exact", "pixels", "similar"), default="exact",
-                        help="exact=字节完全相同（默认）；pixels=像素完全相同；similar=静态整图相似")
+    parser.add_argument("--mode", choices=("exact", "pixels", "similar", "copynce"), default="exact",
+                        help="exact=字节相同（默认）；pixels=像素相同；similar=整图相似；copynce=可选模型")
     parser.add_argument("--similarity-threshold", type=similarity_threshold, default=None,
                         help="similar唯一调参项：0～100整数，默认90；越高越严，100须严格像素相同")
     parser.add_argument("--no-recursive", action="store_false", dest="recursive", help="不扫描子文件夹")
@@ -467,21 +511,18 @@ def main(argv=None):
                         help="pixels 模式帧数上限，默认 200")
     parser.add_argument("--max-total-pixels", type=positive_integer, default=100_000_000,
                         help="pixels 模式单文件所有帧累计像素上限，默认 100000000")
-    options = parser.parse_args(argv)
+    options = parser.parse_args(arguments)
     if options.mode != "similar" and options.similarity_threshold is not None:
         parser.error("--similarity-threshold 仅适用于 --mode similar")
     if options.similarity_threshold is None:
         options.similarity_threshold = 90
     roots = []
     for value in options.paths:
-        path = Path(value).expanduser()
         try:
-            if path.is_symlink():
-                parser.error("不接受符号链接作为输入，请指定真实路径：" + display_text(path))
-            path = path.resolve(strict=True)
+            path = canonical_input(value)
             if not path.is_dir() and not path.is_file():
                 parser.error("输入不是普通文件或文件夹：" + display_text(path))
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             parser.error("无法访问输入：" + display_text(value) + "；" + display_text(exc))
         roots.append(path)
     roots = sorted(set(roots), key=str)

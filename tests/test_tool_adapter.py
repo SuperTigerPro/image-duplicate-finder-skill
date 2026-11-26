@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from test_find_duplicates import Fixture, Image, ROOT
@@ -39,9 +40,47 @@ class ToolAdapterTests(Fixture):
         parameters = function["parameters"]
         self.assertFalse(parameters["additionalProperties"])
         self.assertEqual(set(parameters["required"]), set(self.request()))
-        self.assertEqual(set(parameters["properties"]), set(self.request()) | {"similarity_threshold"})
+        self.assertEqual(set(parameters["properties"]), set(self.request()) | {"similarity_threshold", "backend",
+                         "model_threshold", "whole_only", "search_mode", "top_k", "remote_profile", "remote_directory"})
         self.assertEqual(parameters["properties"]["similarity_threshold"]["default"], 90)
-        self.assertEqual(parameters["properties"]["mode"]["enum"], ["exact", "pixels", "similar"])
+        self.assertEqual(parameters["properties"]["mode"]["enum"], ["exact", "pixels", "similar", "copynce"])
+
+    def test_model_and_network_grants_cannot_come_from_model_arguments(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import tool_adapter as adapter
+        import copynce_cli
+        kwargs = dict(allowed_roots=[self.images], report_root=self.root / "reports")
+        with mock.patch.object(copynce_cli, "main", side_effect=AssertionError("must not run")):
+            with self.assertRaisesRegex(ValueError, "授权模型"):
+                adapter.run_request(self.request(mode="copynce"), **kwargs)
+            with self.assertRaisesRegex(ValueError, "不支持的字段"):
+                adapter.run_request(self.request(mode="copynce", allow_upload=True), allow_model=True, **kwargs)
+            with self.assertRaisesRegex(ValueError, "授权.*上传"):
+                adapter.run_request(self.request(mode="copynce", backend="cloud", remote_profile="remote-1"),
+                                    allow_model=True, remote_profiles={"remote-1": "private-profile"}, **kwargs)
+            with self.assertRaisesRegex(ValueError, "授权范围"):
+                adapter.run_request(self.request(mode="copynce", backend="cloud", remote_profile="remote-1",
+                                                paths=[], remote_directory="approved/../outside"),
+                                    allow_model=True, remote_profiles={"remote-1": "private-profile"},
+                                    remote_roots={"remote-1": ["approved"]}, **kwargs)
+
+    def test_model_request_routes_only_host_approved_options(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import tool_adapter as adapter
+        import copynce_cli
+        req = self.request(mode="copynce", model_threshold=.8, search_mode="exact", whole_only=True)
+        def finish(arguments):
+            out = Path(arguments[arguments.index("--output-dir") + 1]);out.mkdir(parents=True)
+            (out / "duplicates.json").write_text('{"schema_version":3,"matches":[]}')
+            return 0
+        with mock.patch.object(copynce_cli, "main", side_effect=finish) as execute:
+            result = adapter.run_request(req, [self.images], self.root / "reports", allow_model=True,
+                                         model_offline=True)
+        arguments = execute.call_args.args[0]
+        self.assertTrue(result["ok"])
+        self.assertIn("--offline", arguments)
+        self.assertIn("--whole-only", arguments)
+        self.assertNotIn("--allow-upload", arguments)
 
     def test_json_only_exact_roundtrip_and_reports(self):
         self.write("a.png")
