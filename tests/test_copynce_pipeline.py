@@ -1,4 +1,5 @@
 """Verify candidate coverage, Matcher-only decisions and bounded stage accounting."""
+from contextlib import closing
 from pathlib import Path
 import json
 import sqlite3
@@ -221,7 +222,7 @@ class EnhancedPipelineTests(unittest.TestCase):
         self.imageset(3)
         cache = self.root / "later.sqlite3"
         self.scan(cache=cache)
-        with sqlite3.connect(cache) as connection:
+        with closing(sqlite3.connect(cache)) as connection, connection:
             key = connection.execute("SELECT cache_key FROM matcher_results ORDER BY rowid LIMIT 1").fetchone()[0]
             connection.execute("DELETE FROM matcher_results WHERE cache_key=?", (key,))
         raw = self.scan(cache=cache, matcher_budget=1)
@@ -261,7 +262,7 @@ class EnhancedPipelineTests(unittest.TestCase):
         self.scan(cache=cache)
         for corruption in ({"path_a": "/unapproved"}, {"box_a": [-1, 0, 1, 1]},
                            {"matcher_score": float("nan")}, {"model_comparisons": 3}):
-            with sqlite3.connect(cache) as connection:
+            with closing(sqlite3.connect(cache)) as connection, connection:
                 key, text = connection.execute("SELECT cache_key,payload FROM matcher_results").fetchone()
                 payload = json.loads(text)
                 payload.update(corruption)

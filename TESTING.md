@@ -35,7 +35,7 @@
 
 真实云端预检发现旧环境先导入Torch、后导入SQLite会引起ICU/CXXABI冲突；统一为与推理相同的扫描器依赖优先顺序后，API2、实际双模型和完整测试通过。没有修改服务器库或设置绕过环境变量。自动环境准备新增运行探测失败后尝试后续兼容解释器；相关回归以受控模拟验证，不把它称为每种Python发行版的真实安装验证。
 
-上一版Actions的Windows失败已定位为本机执行POSIX服务器任务清理测试时调用os.getuid；此专用用例现按已声明的POSIX适用范围执行。Windows客户端通用测试仍保留，跨平台状态以本次[GitHub Actions](https://github.com/SuperTigerPro/image-duplicate-finder-skill/actions)实际日志为准，CI不下载模型或使用真实服务器配置。
+上一版Actions的Windows失败已定位为本机执行POSIX服务器任务清理测试时调用os.getuid；此专用用例现按已声明的POSIX适用范围执行。本次首次CI另暴露两处缓存测试连接未显式关闭，已补关闭并保留事务提交/回滚语义；生产缓存关闭逻辑未变。Windows客户端及缓存通用测试仍保留，跨平台状态以本次[GitHub Actions](https://github.com/SuperTigerPro/image-duplicate-finder-skill/actions)实际日志为准，CI不下载模型或使用真实服务器配置。
 
 本次公开范围为51个UTF-8源码/说明/测试文件。隐私检查包括真实私有标识、独立地址/账号/凭据/密钥模式和源码字符串复核；发布时还检查暂存区、提交元数据、全部待推送提交及确定性ZIP。真实连接资料、密钥、图片、背景索引、特征、原始报告、日志和测试脚本均在仓库外，只公开上述匿名统计。
 
