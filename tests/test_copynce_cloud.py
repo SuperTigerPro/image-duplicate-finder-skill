@@ -252,6 +252,7 @@ class CloudTests(unittest.TestCase):
             with self.subTest(name=path.name), self.assertRaises((OSError, ValueError, SyntaxError)):
                 cloud._snapshot(path, self.home / (str(i) + "-out.png"))
 
+    @unittest.skipUnless(os.name == "posix", "remote job helper requires POSIX")
     def test_remote_jobs_reject_symlink_roots_and_cleanup_foreign_paths(self):
         base = self.home / "jobs"
         foreign = self.home / ("f"*32)
@@ -343,3 +344,98 @@ class CloudTests(unittest.TestCase):
         self.assertNotIn(private, message)
         self.assertNotIn("/path/to", message)
         self.assertIsNone(ctx.exception.__cause__)
+
+
+    def enhanced_info(self):
+        return dict(weights_present=True, weights_path="/path/to/weights", weights_sha256=cloud.WEIGHTS_SHA256,
+                    dimension=512, api_version=2, report_schema_versions=[3, 4],
+                    supported_profiles=["fast", "enhanced", "deep"], strict_image_roots=True,
+                    strict_auxiliary_resources=True, private_upload_api_version=2,
+                    enhancement=dict(ready=True, matcher_weights_verified=True,
+                        matcher_weights_sha256=cloud.MATCHER_WEIGHTS_SHA256, sn_index_ready=True,
+                        sn_index_fingerprint="a"*64, sn_dimension=512, sn_images=5,
+                        sn_implementation="copynce-official-query-bias-v1", sn_pipeline=cloud.SN_GLOBAL_PIPELINE))
+
+    def test_enhanced_capability_rejection_happens_before_upload(self):
+        base = self.enhanced_info()
+        import copy
+        for change in ({"api_version": 1}, {"strict_auxiliary_resources": False},
+                       {"report_schema_versions": [3]}, {"supported_profiles": ["fast"]},
+                       {"private_upload_api_version": 1}, {"enhancement": {}}, {"enhancement": None}):
+            info = copy.deepcopy(base)
+            info.update(change)
+            with self.subTest(change=list(change)), \
+                 mock.patch.object(cloud, "_info", new=mock.AsyncMock(return_value=info)), \
+                 mock.patch.object(cloud, "_prepare_upload_job", new=mock.AsyncMock()) as prepare, \
+                 mock.patch.object(cloud, "_upload") as upload:
+                with self.assertRaisesRegex(ValueError, "enhanced protocol"):
+                    cloud.scan_upload(self.profile, [self.src], allow_upload=True, model_profile="enhanced")
+                prepare.assert_not_called()
+                upload.assert_not_called()
+
+    def test_enhanced_capabilities_require_official_matching_resources(self):
+        for field, value in (("matcher_weights_sha256", "b"*64), ("matcher_weights_verified", False),
+                             ("sn_pipeline", "different-pipeline"), ("sn_images", 4),
+                             ("sn_index_fingerprint", "not-a-fingerprint"), ("sn_dimension", 384)):
+            info=self.enhanced_info()
+            info["enhancement"][field]=value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                cloud._check_capabilities(info, "enhanced", for_upload=True)
+
+    def test_enhanced_remote_result_must_preserve_profile_schema_and_resources(self):
+        info=self.enhanced_info()
+        raw=dict(weights_sha256=cloud.WEIGHTS_SHA256, dimension=512, profile="enhanced", schema_version=4,
+                 matcher_weights_sha256=cloud.MATCHER_WEIGHTS_SHA256, sn_index_fingerprint="a"*64)
+        result={}
+        @asynccontextmanager
+        async def fake_session(*args):
+            async def call(name, params=None):
+                return info if name=="get_image_dedup_info" else result
+            yield call
+        with mock.patch.object(cloud, "_session", fake_session):
+            for field,value in (("profile", "fast"), ("schema_version", 3),
+                                ("matcher_weights_sha256", "b"*64), ("sn_index_fingerprint", "b"*64)):
+                result=dict(raw,**{field:value})
+                with self.subTest(field=field), self.assertRaisesRegex(ValueError, "did not preserve"):
+                    cloud.scan_remote(self.profile, "gallery", model_profile="enhanced")
+            result=raw
+            self.assertEqual(cloud.scan_remote(self.profile, "gallery", model_profile="enhanced")["profile"], "enhanced")
+
+    def test_enhanced_upload_uses_server_bound_resources_and_private_job(self):
+        job=dict(config="/path/to/job/config",cache="/path/to/job/cache",directory="/path/to/job/images")
+        info=self.enhanced_info()
+        with mock.patch.object(cloud, "_info", new=mock.AsyncMock(return_value=info)), \
+             mock.patch.object(cloud, "_prepare_upload_job", new=mock.AsyncMock(return_value=job)) as prepare, \
+             mock.patch.object(cloud, "_job", side_effect=[True,None]) as helper, \
+             mock.patch.object(cloud, "_scan", new=mock.AsyncMock(side_effect=[{"image_count":0},{"matches":[],"errors":[]}])) as scan, \
+             mock.patch.object(cloud, "_upload") as upload:
+            result=cloud.scan_upload(self.profile,[self.src],allow_upload=True,model_profile="enhanced")
+        self.assertEqual(prepare.await_args.args[2:],("enhanced","a"*64))
+        self.assertEqual([c.args[1] for c in helper.call_args_list],["cache-ready","remove"])
+        self.assertEqual(scan.await_args.args[2]["profile"],"enhanced")
+        self.assertEqual(upload.call_args.args[-1],job["directory"])
+        self.assertNotIn("/path/to/job",json.dumps(result))
+
+
+    def test_invalid_enhanced_budgets_fail_before_private_profile_or_transfer(self):
+        with mock.patch.object(cloud,"load_profile") as load:
+            for opts in ({"candidate_k":257},{"matcher_budget":100001},{"local_view_pairs":9},
+                         {"sn_extra_budget":10001},{"mode":"indexed"}):
+                with self.subTest(opts=opts),self.assertRaises(ValueError):
+                    cloud.scan_upload(self.profile,[self.src],allow_upload=True,model_profile="enhanced",**opts)
+            load.assert_not_called()
+
+
+    def test_deep_whole_only_is_rejected_before_profile_read_or_transfer(self):
+        with mock.patch.object(cloud,"load_profile") as load,self.assertRaisesRegex(ValueError,"local comparison"):
+            cloud.scan_upload(self.profile,[self.src],allow_upload=True,model_profile="deep",tiles=False)
+        load.assert_not_called()
+
+
+    def test_enhanced_matcher_error_preserves_stage_without_remote_diagnostics(self):
+        remote="/path/to/job/images"
+        result={"matches":[],"errors":[{"path":remote+"/a.png","operation":"matcher",
+                "message":"fixture-private-runtime-diagnostic","error_type":"RuntimeError"}]}
+        cloud._map_result(result,{"a.png":self.src},remote)
+        self.assertEqual(result["errors"][0]["operation"],"matcher")
+        self.assertNotIn("fixture-private-runtime-diagnostic",json.dumps(result))

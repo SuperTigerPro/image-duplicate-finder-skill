@@ -1,6 +1,7 @@
 """Deterministic, offline checks for the optional model bootstrap."""
 import contextlib
 import hashlib
+import io
 import os
 from pathlib import Path
 import sys
@@ -114,6 +115,109 @@ class WeightPreparationTests(unittest.TestCase):
         with mock.patch.object(setup.shutil, "which", side_effect=lambda name: str(found) if name == "python3.11" else None), \
                 mock.patch.object(setup, "_python_version", side_effect=lambda path: (3, 11) if path == found else (3, 9)):
             self.assertEqual(setup._bootstrap_python(), (found, (3, 11)))
+
+    def test_matcher_download_is_separately_verified_and_reused_offline(self):
+        with mock.patch.object(setup, "MATCHER_BYTES", len(self.payload)), \
+                mock.patch.object(setup, "MATCHER_SHA256", hashlib.sha256(self.payload).hexdigest()), \
+                mock.patch.dict(os.environ, {"COPYNCE_MATCHER_WEIGHTS":""}):
+            def download(path, **kw):
+                self.assertEqual(kw["file_id"], setup.MATCHER_FILE_ID)
+                path.write_bytes(self.payload)
+            with mock.patch.object(setup, "_download", side_effect=download):
+                path = setup._matcher_weights(None, False)
+            with mock.patch.object(setup, "_download", side_effect=AssertionError("offline download")):
+                self.assertEqual(setup._matcher_weights(None, True), path)
+                path.write_bytes(b"tampered")
+                with self.assertRaises(ValueError):
+                    setup._matcher_weights(None, True)
+
+    def test_matcher_confirmation_cannot_switch_to_descriptor_or_another_file(self):
+        form = ('<form id="download-form" action="https://drive.usercontent.google.com/download">'
+                '<input name="id" value="{}"><input name="confirm" value="t"></form>')
+        self.assertIn(setup.MATCHER_FILE_ID, setup._confirmation(form.format(setup.MATCHER_FILE_ID).encode(), setup.MATCHER_FILE_ID))
+        with self.assertRaises(ValueError):
+            setup._confirmation(form.format(setup.FILE_ID).encode(), setup.MATCHER_FILE_ID)
+
+    def test_online_reuses_probed_cached_runtime_before_bootstrap_or_install(self):
+        cached = setup._venv_python(self.base.resolve() / "runtime" / "py311-fixture-cpu-torch2.7.1")
+        cached.parent.mkdir(parents=True)
+        cached.touch()
+        with mock.patch.dict(os.environ, {setup.PYTHON_ENV: ""}), \
+                mock.patch.object(setup, "_probe", side_effect=lambda path: "cpu" if path == cached else None), \
+                mock.patch.object(setup, "_bootstrap_candidates", side_effect=AssertionError("unnecessary discovery")), \
+                mock.patch.object(setup, "_pip", side_effect=AssertionError("unnecessary installation")):
+            self.assertEqual(setup._environment(False, device="cpu"), cached)
+
+    def test_existing_alternate_python_is_probed_before_any_new_environment(self):
+        first, second = self.base / "signed-host", self.base / "alternate-python"
+        with mock.patch.dict(os.environ, {setup.PYTHON_ENV: ""}), \
+                mock.patch.object(setup, "_bootstrap_candidates", return_value=[(first,(3,11)),(second,(3,11))]), \
+                mock.patch.object(setup, "_probe", side_effect=lambda path: "cpu" if path == second else None), \
+                mock.patch.object(setup, "_pip", side_effect=AssertionError("unnecessary installation")):
+            self.assertEqual(setup._environment(False, device="cpu"), second)
+
+    def test_failed_actual_probe_tries_an_isolated_second_python_of_same_version(self):
+        first, second = self.base / "signed-host", self.base / "alternate-python"
+        created = []
+        output = io.StringIO()
+        def create(command, **kwargs):
+            prefix = Path(command[-1])
+            executable = setup._venv_python(prefix)
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.touch()
+            created.append((Path(command[0]), executable))
+            return setup.subprocess.CompletedProcess(command, 0)
+        def probe(path):
+            # Both base interpreters have a compatible version but lack a ready
+            # runtime. Only the second venv can actually import native modules.
+            return "cpu" if any(source == second and path == executable for source,executable in created) else None
+        with mock.patch.dict(os.environ, {setup.PYTHON_ENV: ""}), \
+                mock.patch.object(setup, "_bootstrap_candidates", return_value=[(first,(3,11)),(second,(3,11))]), \
+                mock.patch.object(setup, "_probe", side_effect=probe), \
+                mock.patch.object(setup.subprocess, "run", side_effect=create), \
+                mock.patch.object(setup, "_pip") as install, contextlib.redirect_stderr(output):
+            result = setup._environment(False, device="cpu")
+        self.assertEqual([source for source,_ in created], [first,second])
+        self.assertNotEqual(created[0][1], created[1][1])
+        self.assertEqual(result, created[1][1])
+        self.assertGreaterEqual(install.call_count, 5)
+        self.assertTrue(all(call.kwargs.get("_quiet") for call in install.call_args_list))
+        self.assertIn("尝试下一个", output.getvalue())
+        self.assertNotIn(str(first), output.getvalue())
+        self.assertNotIn(str(second), output.getvalue())
+        self.assertNotIn(str(self.base), output.getvalue())
+
+    def test_candidate_discovery_keeps_later_path_installation_of_same_version(self):
+        directories = [self.base / "signed-bin", self.base / "ordinary-bin"]
+        names = []
+        for directory in directories:
+            directory.mkdir()
+            executable = directory / ("python3.11.exe" if os.name == "nt" else "python3.11")
+            executable.touch()
+            executable.chmod(0o700)
+            names.append(executable)
+        with mock.patch.dict(os.environ, {"PATH":os.pathsep.join(map(str,directories))}), \
+                mock.patch.object(setup.shutil, "which", side_effect=lambda name: str(names[0]) if name == "python3.11" else None), \
+                mock.patch.object(setup, "_python_version", side_effect=lambda path: (3,11) if path in names else (3,9)):
+            self.assertEqual(setup._bootstrap_candidates(), [(names[0],(3,11)),(names[1],(3,11))])
+
+    def test_explicit_incompatible_python_does_not_silently_switch(self):
+        with mock.patch.dict(os.environ, {setup.PYTHON_ENV:str(self.base / "explicit-python")}), \
+                mock.patch.object(setup, "_probe", return_value=None), \
+                mock.patch.object(setup, "_bootstrap_candidates", side_effect=AssertionError("explicit selection")):
+            with self.assertRaisesRegex(RuntimeError, "指定的模型 Python"):
+                setup._environment(False)
+
+    def test_cache_permission_failure_is_generic_and_does_not_retry_installs(self):
+        first, second = self.base / "signed-host", self.base / "alternate-python"
+        with mock.patch.dict(os.environ, {setup.PYTHON_ENV:""}), \
+                mock.patch.object(setup, "_probe", return_value=None), \
+                mock.patch.object(setup, "_bootstrap_candidates", return_value=[(first,(3,11)),(second,(3,11))]), \
+                mock.patch.object(setup, "locked", side_effect=PermissionError("fixture private location")), \
+                mock.patch.object(setup, "_pip", side_effect=AssertionError("permission failure must stop")):
+            with self.assertRaisesRegex(RuntimeError, "模型缓存不可写") as error:
+                setup._environment(False, device="cpu")
+        self.assertNotIn("fixture private location", str(error.exception))
 
 
 if __name__ == "__main__":

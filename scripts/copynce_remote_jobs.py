@@ -1,5 +1,6 @@
 """Private job lifecycle helper, sent on stdin to a POSIX SSH server."""
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -54,11 +55,41 @@ def verified_job(job):
         return False
 
 
+@contextmanager
+def active_job(job):
+    """Hold the owned job marker while a multi-stage worker is using its files."""
+    if not verified_job(job):
+        raise ValueError("Unrecognized private job")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(job / "owner", flags), "rb") as handle:
+        if os.name == "posix":
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            if os.name == "posix":
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def remove_job(job):
     if not verified_job(job):
         return False
-    shutil.rmtree(job)
-    return True
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        with os.fdopen(os.open(job / "owner", flags), "rb") as handle:
+            if os.name == "posix":
+                import fcntl
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return False
+            if not verified_job(job):
+                return False
+            shutil.rmtree(job)
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def reap(now):
@@ -99,12 +130,28 @@ def main():
             raise ValueError("Unrecognized private job")
         no_links(images)
         return {f.name: f.stat().st_size for f in images.iterdir() if not f.is_symlink() and f.is_file()}
+    return create_job(args.job_id, json.loads(args.settings))
+
+
+def create_job(job_id, settings, *, allow_auxiliary=False):
+    """Only the trusted server supplies persistent read-only auxiliary resources."""
+    os.umask(0o077)
+    private_base()
     reap(time.time())
-    cfg = json.loads(args.settings)
-    if (not isinstance(cfg, dict) or set(cfg) - {"weights", "device", "batch_size", "max_pixels"}
+    job = target(job_id)
+    images = job / "images"
+    allowed = {"weights", "device", "batch_size", "max_pixels"}
+    if allow_auxiliary:
+        allowed |= {"matcher_weights", "sn_index"}
+    cfg = dict(settings)
+    if (not isinstance(cfg, dict) or set(cfg) - allowed
             or not isinstance(cfg.get("weights"), str) or not Path(cfg["weights"]).is_absolute()):
         raise ValueError("Invalid private runtime settings")
-    no_links(Path(cfg["weights"]))
+    for key in ("weights", "matcher_weights", "sn_index"):
+        if key in cfg:
+            if not isinstance(cfg[key], str) or not Path(cfg[key]).is_absolute():
+                raise ValueError("Invalid private model resource")
+            no_links(Path(cfg[key]))
     job.mkdir(mode=0o700)
     try:
         (job / "owner").write_text(job.name)
@@ -116,15 +163,29 @@ def main():
         config.chmod(0o600)
         # The watchdog owns only this random job. Reaping on future operations
         # also covers a machine reboot in which the OS terminated the watchdog.
-        watchdog = """import pathlib, shutil, sys, time
+        watchdog = """import fcntl, pathlib, shutil, sys, time
 job = pathlib.Path(sys.argv[1])
 marker = job / 'owner'
 deadline = time.monotonic() + int(sys.argv[2])
-while time.monotonic() < deadline and not job.is_symlink() and marker.is_file():
-    time.sleep(min(60, max(0, deadline - time.monotonic())))
-if (not any(p.is_symlink() for p in (job, *job.parents)) and not marker.is_symlink()
-        and marker.is_file() and marker.stat().st_size == 32 and marker.read_text() == job.name):
-    shutil.rmtree(job)
+while marker.is_file() and not job.is_symlink():
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(min(60, remaining))
+        continue
+    if any(p.is_symlink() for p in (job, *job.parents)) or marker.is_symlink():
+        break
+    try:
+        with marker.open('rb') as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                time.sleep(60)
+                continue
+            if marker.stat().st_size == 32 and marker.read_text() == job.name:
+                shutil.rmtree(job)
+        break
+    except FileNotFoundError:
+        break
 """
         subprocess.Popen([sys.executable, "-c", watchdog, str(job), str(TTL)],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

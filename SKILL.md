@@ -3,7 +3,7 @@ name: image-duplicate-finder-skill
 description: 检查用户选定的图片文件或目录，查找严格重复、静态整图相似或疑似跨图局部复用。支持 SHA-256、完整解码像素、整图相似和可选的本地或 SSH 云端 CopyNCE。适用于核查裁剪、拼接和嵌套。输出路径、分数、匹配区域和 CSV/JSON/Markdown 报告。
 license: MIT
 metadata:
-  version: "1.2.0"
+  version: "1.3.0"
 ---
 
 # 图片查重与疑似复用核查
@@ -37,7 +37,7 @@ ChatGPT、GPT 或 DeepSeek 普通聊天没有本地工具时，不得假装能�
 - **pixels（用户要求内容相同、忽略元数据或跨无损格式时）**：使用 Pillow 校正 EXIF 方向；普通 8 位图归一为 RGBA 后比较尺寸和全部像素。动画/多页图比较全部解码帧，并比较动画时长、循环与 ICC 配置。
 - **similar（用户要求相似图时）**：静态整图相似检测，覆盖常见缩放、重新压缩和轻微亮度/颜色变化。唯一算法调参项是 `--similarity-threshold`，0～100整数，默认推荐90，日常80～95；越高越严。用户未指定时直接用90，不让用户选择 pHash、SSIM 等内部参数。100须通过完整分辨率严格像素核验，其余均为疑似相似。
 - exact/pixels 不容忍像素变化。similar 也不启用裁剪、局部复用、任意旋转/翻转或语义检索。完整评分、资源与范围见 [相似检测说明](references/similarity.md)。
-- **copynce（实验性增强）**：用本机或用户指定的服务器，以整图和固定重叠裁块检索跨文件复用，显示原始余弦分数和候选窗口。0.75 是待领域校准的起始门槛，与 similar 的默认 90 分分别报告；模型高分不能替代字节/像素核验，窗口不是精确复制边界。
+- **copynce（实验性模型）**：一般模型核查显式使用 `--quality enhanced`：Descriptor 整图及局部召回、官方查询侧 SN、Matcher 图片对复核。先确认独立背景索引可用；本机用 `--sn-index`，云端由私有服务配置绑定。需要更深入复核时用 `--quality deep` 的官方代码 LCE。旧命令省略质量参数仍是 `fast`，其 0.75 余弦阈值不能用于增强流程。Matcher 默认 0.5 只是待校准起点。完整操作及资源准备见 [模型指南](references/copynce.md)。
 - 普通查重未指定方式时，说明 CLI 默认“文件字节完全相同”；不要把 exact 未发现重复解释成没有像素相同的图。
 - 用户要求多种方式都检查时分别运行到新的报告目录，不把严格重复组和疑似相似对混合计数。相似关系不传递，不用A像B、B像C推断A像C。
 
@@ -78,7 +78,8 @@ python3 "<SKILL_DIR>/scripts/find_duplicates.py" "/用户选择的图片目录" 
 本地模型例子：
 
 ~~~bash
-python3 "<SKILL_DIR>/scripts/find_duplicates.py" "/选定图库" --mode copynce --backend local --output-dir "/可写位置/新报告"
+python3 "<SKILL_DIR>/scripts/find_duplicates.py" "/选定图库" --mode copynce --backend local \
+  --quality enhanced --sn-index "/已准备的独立背景索引" --output-dir "/可写位置/新报告"
 ~~~
 
 普通模式常用选项：
@@ -122,9 +123,9 @@ exact 通过扩展名识别候选，不验证是否为有效图像；pixels 遇�
 
 similar模式读取schema_version=2的similar_pairs，按图片对、分数、当前门槛和严格像素一致标记交付；不要读取空groups后声称无相似图，也不计算可清理字节。报告有结果时附本地并排预览（仅前12对），完整清单仍以JSON/CSV/Markdown为准。有读取错误或达到内部安全上限时必须说明不完整，不能用部分结果宣称阈值召回关系。低纹理图即使高分也要人工复核。
 
-模型模式读取 schema_version=3 的 `matches`。交付路径、分数和候选窗口，核对 `complete`、`exhaustive`、`truncated`。仅当 `all_matches_reported` 为真时才称为指定范围与阈值下的完整清单。候选需人工核查。
+模型快速模式读取 schema_version=3，增强及深查读取 schema_version=4 的 `matches`。增强模式分别交付 Descriptor、双向 SN 和 Matcher 分数；SN 分数不是余弦或概率，Matcher 分数未经过领域概率校准。核对 `files_complete`、`budget_complete`、`complete`、`exhaustive`、`truncated` 和 `stage_totals`，说明计划、缓存复用、本次新增和待复核数量。本机/服务器已有图库可用相同参数和新报告目录重跑继续；上传任务结束仍清理缓存，不承诺跨上传任务恢复。仅当 `all_matches_reported` 为真时才称为指定范围与阈值下的完整清单。候选需人工核查。
 
-模型的 `files_complete`（与 `complete` 同义）只表示文件处理完整；近似检索或 top-k 截断即使退出码0也不能称全部命中已找到。整图＋裁块完整比较仅覆盖本次固定窗口，不承诺任意裁剪、极小嵌图或单图内部克隆。云端终端摘要不回显原图路径；完整路径仅保留在仓库外私有报告。需要分享时另生成脱敏摘要，不能将真实报告当公开测试记录。
+模型的 `files_complete` 只表示文件处理完整；schema4 的 `complete` 还要求复核预算内计划已完成且无错误，预算耗尽返回1。近似检索或 top-k 截断即使退出码0也不能称全部命中已找到。整图＋裁块完整比较仅覆盖本次固定窗口，不承诺任意裁剪、极小嵌图或单图内部克隆。云端终端摘要不回显原图路径；完整路径仅保留在仓库外私有报告。需要分享时另生成脱敏摘要，不能将真实报告当公开测试记录。
 
 本机图片上传默认生成去元数据的 RGB PNG 推理副本。仅用户明确要求传原字节时使用 `--upload-original`，说明 EXIF 等元数据也会发送。任务结束或取消后确认清理；清理未确认时保留匿名任务ID，重连后用 `--cleanup-job` 精确清理，不能宣称已删除。
 

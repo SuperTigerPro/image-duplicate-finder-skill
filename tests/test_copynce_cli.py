@@ -212,3 +212,37 @@ class ModelCLITests(unittest.TestCase):
             cli.local_scan(records, args, {})
         req = json.loads(proc.call_args.kwargs["input"])
         self.assertEqual(req["file_stamps"][str(f)], list(records[str(f)].stamp))
+
+    def test_enhanced_requires_auxiliary_before_model_download(self):
+        f = self.file("selected.png")
+        with mock.patch("copynce_setup.prepare_enhanced", side_effect=AssertionError("must validate first")):
+            self.assertEqual(cli.main([str(f), "--quality", "enhanced"]), 2)
+
+    def test_enhanced_cli_keeps_ssh_profile_separate_from_quality(self):
+        args = cli.parse(["--backend", "cloud", "--profile", "private-profile", "--remote-directory", ".",
+                          "--quality", "enhanced", "--matcher-threshold", ".6"])
+        self.assertEqual((args.profile, args.quality, args.matcher_threshold), (Path("private-profile"), "enhanced", .6))
+        with self.assertRaises(SystemExit):
+            cli.parse(["gallery", "--quality", "enhanced", "--threshold", ".53"])
+        with self.assertRaises(SystemExit):
+            cli.parse(["gallery", "--quality", "enhanced", "--matcher-threshold", "-0.1"])
+
+    def test_enhanced_report_separates_sn_and_classifier_and_detects_pending(self):
+        raw = sample(["/demo/a.png", "/demo/b.png"])
+        raw.update(schema_version=4, profile="enhanced", budget_complete=True,
+                   stage_totals={"matcher_verified":1,"matcher_pending":0,"matcher_failed":0,"planned_candidates":1})
+        raw["matches"][0].update(descriptor_cosine=.6, local_cosine=.8, sn_a_to_b=-1.6,
+                                  sn_b_to_a=-.2, matcher_score=.9)
+        report = reports.build_report(raw, "local", [], {"matcher_threshold":.5})
+        self.assertEqual(report["score_type"], "classifier_sigmoid")
+        self.assertEqual(report["matches"][0]["sn_a_to_b"], -1.6)
+        self.assertTrue(report["complete"])
+        raw.update(pairs_possible=3, exhaustive=False, budget_complete=False)
+        raw["stage_totals"].update(planned_candidates=2, matcher_pending=1)
+        report = reports.build_report(raw, "local", [], {"matcher_threshold":.5})
+        self.assertTrue(report["files_complete"])
+        self.assertFalse(report["complete"])
+        self.assertFalse(report["all_matches_reported"])
+        raw["stage_totals"]["matcher_pending"] = 0
+        with self.assertRaises(ValueError):
+            reports.build_report(raw, "local", [], {"matcher_threshold":.5})

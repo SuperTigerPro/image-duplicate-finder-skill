@@ -156,7 +156,8 @@ def _load_cached(conn, path, pipeline, signature, tiles, dimension):
     return str(path), (width, height), boxes, features
 
 
-def _features(files, model, cache, pipeline, tiles, batch_size, max_pixels, report_error):
+def _features(files, model, cache, pipeline, tiles, batch_size, max_pixels, report_error, content_hashes=None,
+              pixel_hashes=None):
     items = []
     pending_images = []
     pending = []
@@ -200,6 +201,14 @@ def _features(files, model, cache, pipeline, tiles, batch_size, max_pixels, repo
             core.assert_unchanged(record, os.stat(record.path, follow_symlinks=False))
             with core.checked_stream(record) as stream:
                 content_id = core.exact_digest(stream)
+            if content_hashes is not None:
+                content_hashes[str(record.path)] = content_id
+            if pixel_hashes is not None:
+                if __package__:
+                    from .copynce_sn import pixel_sha256
+                else:
+                    from copynce_sn import pixel_sha256
+                pixel_hashes[str(record.path)] = pixel_sha256(record, max_pixels)
             stamp = ":".join(map(str, record.stamp)) + ":" + content_id
             item = _load_cached(cache, record.path, pipeline, stamp, tiles, model.dimension)
             if item is not None:
@@ -351,7 +360,9 @@ def _load_descriptor(weights, device):
 
 def scan(paths: list[Path], *, weights: Path, cache: Path | None, device="auto", batch_size=8,
          tiles=True, threshold=0.75, top_k=100, mode="auto", recursive=True, include_hidden=False,
-         extensions=core.DEFAULT_EXTENSIONS, max_pixels=40_000_000, neighbors=32, file_stamps=None) -> dict:
+         extensions=core.DEFAULT_EXTENSIONS, max_pixels=40_000_000, neighbors=32, file_stamps=None,
+         profile="fast", matcher_weights=None, sn_index=None, candidate_k=32, matcher_budget=10000,
+         local_view_pairs=2, sn_extra_budget=1000, matcher_threshold=.5, source_groups=None) -> dict:
     """Rank distinct pairs using the highest cosine between their requested views."""
     if not math.isfinite(threshold) or not -1 <= threshold <= 1:
         raise ValueError("threshold must be a finite number between -1 and 1")
@@ -362,6 +373,18 @@ def scan(paths: list[Path], *, weights: Path, cache: Path | None, device="auto",
         raise ValueError("top_k exceeds the model result safety limit")
     if mode not in ("exact", "indexed", "auto"):
         raise ValueError("mode must be auto, exact or indexed")
+    if profile not in {"fast", "enhanced", "deep"}:
+        raise ValueError("profile must be fast, enhanced or deep")
+    if profile != "fast" and mode == "indexed":
+        raise ValueError("Enhanced profiles currently require exact or auto candidate search")
+    if profile == "deep" and not tiles:
+        raise ValueError("Deep uses local crop ensembling and cannot be combined with whole-only")
+    if profile != "fast" and cache is not None:
+        if __package__:
+            from .copynce_sn import _private_path
+        else:
+            from copynce_sn import _private_path
+        cache = _private_path(cache, exists=False)
     scanner = _collect(paths, recursive, include_hidden, extensions, file_stamps)
     candidate_count = len(paths) if file_stamps is not None else len(scanner.files)
     if len(scanner.files) > MAX_IMAGES:
@@ -374,9 +397,12 @@ def scan(paths: list[Path], *, weights: Path, cache: Path | None, device="auto",
         scanner.errors.append(dict(path=str(path), operation="descriptor", message=message))
 
     variant = f"{model.weights_id}:{PIPELINE}:tiles={int(tiles)}"
+    content_hashes = {}
+    pixel_hashes = {} if profile != "fast" else None
     conn = _open_cache(cache) if cache is not None else None
     try:
-        items, hits = _features(scanner.files, model, conn, variant, tiles, batch_size, max_pixels, report_error)
+        items, hits = _features(scanner.files, model, conn, variant, tiles, batch_size, max_pixels, report_error,
+                                content_hashes=content_hashes, pixel_hashes=pixel_hashes)
     finally:
         if conn is not None:
             conn.close()
@@ -399,6 +425,31 @@ def scan(paths: list[Path], *, weights: Path, cache: Path | None, device="auto",
     hits = len(hits.intersection(item[0] for item in items))
     possible = n * (n - 1) // 2
     view_count = sum(len(item[2]) for item in items)
+    if profile != "fast":
+        if __package__:
+            from . import copynce_pipeline
+        else:
+            import copynce_pipeline
+        descriptor_device = model.device
+        enhanced = copynce_pipeline.run(items, selected, content_hashes, scanner, model, profile=profile,
+                                       matcher_weights=matcher_weights, sn_index=sn_index, candidate_k=candidate_k,
+                                       matcher_budget=matcher_budget, local_view_pairs=local_view_pairs,
+                                       sn_extra_budget=sn_extra_budget, matcher_threshold=matcher_threshold,
+                                       top_k=top_k, device=device, max_pixels=max_pixels,
+                                       pixel_hashes=pixel_hashes, source_groups=source_groups, cache=cache)
+        return dict(inputs=[str(path) for path in scanner.roots], skipped=dict(scanner.skipped),
+                    directory=str(scanner.roots[0]) if len(scanner.roots) == 1 else None,
+                    weights_sha256=model.weights_id, dimension=model.dimension, device=descriptor_device,
+                    pipeline=PIPELINE, precision="float32", model_id="copynce-descriptor-vits16-224",
+                    device_fallbacks=list(model.fallbacks), threshold=threshold, descriptor_threshold_applied=False,
+                    top_k=top_k, tiles=tiles, recursive=recursive, mode_requested=mode, neighbors=neighbors,
+                    auto_index_views=AUTO_INDEX_VIEWS, fallback=None, view_count=view_count,
+                    max_views_per_image=max((len(item[2]) for item in items), default=0), pairs_possible=possible,
+                    candidate_file_count=candidate_count, image_count=n,
+                    safety_limits=dict(max_images=MAX_IMAGES, max_views=MAX_VIEWS, max_returned_pairs=MAX_RETURNED_PAIRS,
+                                       max_candidate_pairs=copynce_pipeline.MAX_CANDIDATE_PAIRS),
+                    cache_hits=hits, cache_misses=n - hits, error_count=len(scanner.errors), errors=scanner.errors,
+                    coordinate_system="EXIF-oriented pixel [x0,y0,x1,y1), exclusive upper endpoints", **enhanced)
     use_index = mode == "indexed" or (mode == "auto" and view_count > AUTO_INDEX_VIEWS)
     fallback = None
     if use_index:

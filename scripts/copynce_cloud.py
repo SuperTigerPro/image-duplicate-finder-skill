@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -34,6 +35,10 @@ IMAGE_SUFFIXES = {
     "pbm": {".pbm", ".pnm"}, "pgm": {".pgm", ".pnm"}, "ppm": {".ppm", ".pnm"},
 }
 UPLOAD_EXTENSIONS = frozenset().union(*IMAGE_SUFFIXES.values())
+# Public, independently verified official Matcher checkpoint identifier.
+MATCHER_WEIGHTS_SHA256 = "dd8dea1c345039bbda303c42457aa3a0389d46fb37ea39506bfb1faddedda1df"
+SN_GLOBAL_PIPELINE = "copynce-static-rgb224-exif-v4-f32:global-only"
+
 
 
 def validate_upload_image(stream, suffix=None):
@@ -255,11 +260,47 @@ async def _info(profile):
         return await call("get_image_dedup_info")
 
 
+def _check_capabilities(info, model_profile, *, for_upload=False):
+    if model_profile == "fast":
+        return None
+    enhancement = info.get("enhancement", {})
+    if (not isinstance(enhancement, dict) or not isinstance(info.get("report_schema_versions"), list)
+            or not isinstance(info.get("supported_profiles"), list)):
+        raise ValueError("The remote server lacks the requested enhanced protocol and resource capabilities")
+    fingerprint = enhancement.get("sn_index_fingerprint")
+    valid = (type(info.get("api_version")) is int and info["api_version"] >= 2
+             and 4 in info.get("report_schema_versions", [])
+             and model_profile in info.get("supported_profiles", [])
+             and info.get("strict_image_roots") is True
+             and info.get("strict_auxiliary_resources") is True
+             and info.get("weights_sha256") == WEIGHTS_SHA256 and info.get("dimension") == 512
+             and enhancement.get("ready") is True and enhancement.get("matcher_weights_verified") is True
+             and enhancement.get("matcher_weights_sha256") == MATCHER_WEIGHTS_SHA256
+             and enhancement.get("sn_index_ready") is True and enhancement.get("sn_dimension") == 512
+             and enhancement.get("sn_implementation") == "copynce-official-query-bias-v1"
+             and enhancement.get("sn_pipeline") == SN_GLOBAL_PIPELINE
+             and type(enhancement.get("sn_images")) is int and enhancement["sn_images"] >= 5
+             and isinstance(fingerprint, str) and re.fullmatch(r"[a-f0-9]{64}", fingerprint))
+    if for_upload:
+        valid = valid and type(info.get("private_upload_api_version")) is int and info["private_upload_api_version"] >= 2
+    if not valid:
+        raise ValueError("The remote server lacks the requested enhanced protocol, verified models or compatible private SN resource")
+    return fingerprint
+
+
+async def _prepare_upload_job(profile, job_id, model_profile, fingerprint):
+    async with _session(profile) as call:
+        return await call("create_image_dedup_upload_job", dict(job_id=job_id, profile=model_profile,
+                                                               expected_sn_fingerprint=fingerprint))
+
+
 async def _scan(profile, directory, options, config=None, job=None, require_strict_remote=False):
     async with _session(profile, config) as call:
         info = await call("get_image_dedup_info")
         if not info.get("weights_present"):
             raise ValueError("The remote CopyNCE weights are missing")
+        model_profile = options.get("profile", "fast")
+        fingerprint = _check_capabilities(info, model_profile, for_upload=bool(job))
         if require_strict_remote and info.get("strict_image_roots") is not True:
             raise ValueError("The host requires a server enforcing strict image roots and rejecting symlinks")
         if job:
@@ -270,6 +311,12 @@ async def _scan(profile, directory, options, config=None, job=None, require_stri
         result = await call("find_similar_images", dict(directory=directory, **options))
         if result.get("weights_sha256") != WEIGHTS_SHA256 or result.get("dimension") != 512:
             raise ValueError("Unexpected remote descriptor weights or dimensions")
+        if model_profile != "fast":
+            if (result.get("profile") != model_profile
+                    or result.get("schema_version", result.get("report_schema_version")) != 4
+                    or result.get("matcher_weights_sha256") != MATCHER_WEIGHTS_SHA256
+                    or result.get("sn_index_fingerprint") != fingerprint):
+                raise ValueError("The remote result did not preserve the requested enhanced profile and resources")
         if not result.get("device"):
             result["device"] = (await call("get_image_dedup_info")).get("device", "remote")
         return result
@@ -365,7 +412,7 @@ def _map_result(result, names, remote_dir):
                 raise ValueError("The server returned a path outside this upload job")
             row[key] = paths[row[key]]
     errors = []
-    operations = {"stat", "scan", "verify", "descriptor", "decode", "remote"}
+    operations = {"stat", "scan", "verify", "descriptor", "decode", "matcher", "sn", "remote"}
     error_types = {"OSError", "ValueError", "SyntaxError", "PermissionError", "FileNotFoundError",
                    "UnidentifiedImageError", "DecompressionBombError", "DecompressionBombWarning", "RuntimeError"}
     for item in result.get("errors", []):
@@ -384,10 +431,32 @@ def _map_result(result, names, remote_dir):
 
 def cloud_scan(profile, *, paths=(), remote_directory=None, allow_upload=False, tiles=True,
                threshold=.75, top_k=100, mode="auto", recursive=True, require_strict_remote=True,
-               file_stamps=None, upload_original=False):
+               file_stamps=None, upload_original=False, model_profile="fast", candidate_k=32,
+               matcher_budget=10000, local_view_pairs=2, sn_extra_budget=1000, matcher_threshold=.5):
     """Run in a remote directory or explicitly transfer an approved local selection."""
+    if model_profile not in ("fast", "enhanced", "deep"):
+        raise ValueError("Unsupported model quality profile")
+    if (type(candidate_k) is not int or not 1 <= candidate_k <= 256
+            or type(matcher_budget) is not int or not 1 <= matcher_budget <= 100000
+            or type(local_view_pairs) is not int or not 0 <= local_view_pairs <= 8
+            or type(sn_extra_budget) is not int or not 0 <= sn_extra_budget <= 10000
+            or type(matcher_threshold) not in (int, float) or not math.isfinite(matcher_threshold)
+            or not 0 <= matcher_threshold <= 1):
+        raise ValueError("Invalid enhanced retrieval or Matcher limits")
+    if (mode not in ("auto", "exact", "indexed") or type(top_k) is not int or not 1 <= top_k <= 20000
+            or type(threshold) not in (int, float) or not math.isfinite(threshold) or not -1 <= threshold <= 1
+            or type(tiles) is not bool or type(recursive) is not bool):
+        raise ValueError("Invalid remote retrieval parameters")
+    if model_profile != "fast" and mode == "indexed":
+        raise ValueError("Enhanced profiles do not support indexed retrieval")
+    if model_profile == "deep" and not tiles:
+        raise ValueError("Deep profile requires its local comparison views")
     conn = load_profile(profile)
     options = dict(tiles=tiles, threshold=threshold, top_k=top_k, mode=mode, recursive=recursive)
+    if model_profile != "fast":
+        options.update(profile=model_profile, candidate_k=candidate_k, matcher_budget=matcher_budget,
+                       local_view_pairs=local_view_pairs, sn_extra_budget=sn_extra_budget,
+                       matcher_threshold=matcher_threshold)
     if remote_directory is not None:
         if paths or allow_upload or not isinstance(remote_directory, str) or not remote_directory.strip():
             raise ValueError("Select one remote directory without local upload inputs")
@@ -411,15 +480,19 @@ def cloud_scan(profile, *, paths=(), remote_directory=None, allow_upload=False, 
             _snapshot(path, stage / name, stamp, upload_original=upload_original)
             names[name] = path
         info = asyncio.run(_info(conn))
+        fingerprint = _check_capabilities(info, model_profile, for_upload=True)
         weights = info.get("weights_path")
         if not info.get("weights_present") or not isinstance(weights, str) or not PurePosixPath(weights).is_absolute():
             raise ValueError("The remote server must provide its installed CopyNCE weights path")
         cfg = {"weights": weights, "device": info.get("device", "auto"), "batch_size": info.get("batch_size", 8), "max_pixels": info.get("max_pixels", 40_000_000)}
         try:
-            job = _job(conn, "create", job_id, json.dumps(cfg))
+            if model_profile == "fast":
+                job = _job(conn, "create", job_id, json.dumps(cfg))
+            else:
+                job = asyncio.run(_prepare_upload_job(conn, job_id, model_profile, fingerprint))
             # An empty-gallery scan checks the actual loaded model hash and verifies
             # the private SQLite cache before any source image is sent, also on legacy servers.
-            probe = dict(options, tiles=False, top_k=1, mode="exact")
+            probe = dict(options, tiles=(model_profile == "deep"), top_k=1, mode="exact")
             check = asyncio.run(_scan(conn, ".", probe, job["config"], job))
             if check.get("image_count") != 0 or not _job(conn, "cache-ready", job_id):
                 raise ValueError("The remote server did not initialize an empty gallery with a private descriptor cache")

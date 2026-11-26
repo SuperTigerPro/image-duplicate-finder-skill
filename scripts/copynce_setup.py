@@ -23,6 +23,10 @@ FILE_ID = "1fWChrrOovX8JOcNNCgrj6liXR2L8yKEu"
 CHECKPOINT = "descriptor_vits_224.pth.tar"
 WEIGHT_SHA256 = "829fdf4ae032bac24b4fcc60535cfc3b53026af083b33a0b8c71f1973f2166db"
 WEIGHT_BYTES = 87_514_773
+MATCHER_FILE_ID = "1g6bAUTfyEXR20bUbEtHH_i5NBfrbDYHq"
+MATCHER_CHECKPOINT = "matcher_vits_224.pth.tar"
+MATCHER_SHA256 = "dd8dea1c345039bbda303c42457aa3a0389d46fb37ea39506bfb1faddedda1df"
+MATCHER_BYTES = 86_733_215
 DRIVE = "https://drive.usercontent.google.com/download"
 TORCH = "2.7.1"
 PYPI = "https://pypi.org/simple"
@@ -98,6 +102,18 @@ def verify(path: Path) -> Path:
     return path
 
 
+def verify_matcher(path: Path) -> Path:
+    if not path.is_file() or path.stat().st_size != MATCHER_BYTES:
+        raise ValueError("Matcher 权重文件大小不正确，请选择完整的官方权重")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    if digest.hexdigest() != MATCHER_SHA256:
+        raise ValueError("Matcher 权重的 SHA-256 校验失败")
+    return path
+
+
 class _DriveForm(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -119,18 +135,19 @@ class _DriveForm(HTMLParser):
             self.in_form = False
 
 
-def _confirmation(html: bytes) -> str:
+def _confirmation(html: bytes, file_id=FILE_ID) -> str:
     form = _DriveForm()
     form.feed(html.decode("utf-8", errors="replace"))
     action = urllib.parse.urlparse(form.action)
     if ((action.scheme, action.netloc, action.path) != ("https", "drive.usercontent.google.com", "/download")
-            or form.fields.get("id") != FILE_ID or not form.fields.get("confirm")):
-        raise ValueError("Google Drive 未返回公开的 Descriptor 权重，可使用离线权重文件")
+            or form.fields.get("id") != file_id or not form.fields.get("confirm")):
+        raise ValueError("Google Drive 未返回指定的公开权重，可使用离线权重文件")
     return DRIVE + "?" + urllib.parse.urlencode(form.fields)
 
 
-def _download(destination: Path):
-    url = DRIVE + "?" + urllib.parse.urlencode({"id": FILE_ID, "export": "download", "confirm": "t"})
+def _download(destination: Path, file_id=FILE_ID, expected_bytes=None):
+    limit = WEIGHT_BYTES if expected_bytes is None else expected_bytes
+    url = DRIVE + "?" + urllib.parse.urlencode({"id": file_id, "export": "download", "confirm": "t"})
     # A cookie jar permits Drive's optional public-file confirmation challenge.
     import http.cookiejar
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -140,13 +157,13 @@ def _download(destination: Path):
             if response.headers.get_content_type() == "text/html":
                 if attempt:
                     raise ValueError("Google Drive 当前无法提供权重，可使用离线权重文件")
-                url = _confirmation(response.read(512 * 1024))
+                url = _confirmation(response.read(512 * 1024), file_id=file_id)
                 continue
             total = 0
             with destination.open("wb") as stream:
                 for chunk in iter(lambda: response.read(1024 * 1024), b""):
                     total += len(chunk)
-                    if total > WEIGHT_BYTES:
+                    if total > limit:
                         raise ValueError("下载响应超出已知权重文件大小")
                     stream.write(chunk)
             return
@@ -172,6 +189,32 @@ def _weights(explicit, offline):
         try:
             _download(temporary)
             verify(temporary)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return target
+
+
+def _matcher_weights(explicit, offline):
+    requested = explicit or os.environ.get("COPYNCE_MATCHER_WEIGHTS")
+    if requested:
+        return verify_matcher(Path(requested).expanduser().resolve())
+    target = user_cache() / "weights" / MATCHER_CHECKPOINT
+    with locked(target.parent / ".matcher-download.lock"):
+        if target.exists():
+            try:
+                return verify_matcher(target)
+            except ValueError:
+                if offline:
+                    raise
+        if offline:
+            raise FileNotFoundError("离线模式未找到 Matcher 权重，请指定 --matcher-weights")
+        fd, temporary = tempfile.mkstemp(prefix=".matcher-", dir=target.parent)
+        os.close(fd)
+        temporary = Path(temporary)
+        try:
+            _download(temporary, file_id=MATCHER_FILE_ID, expected_bytes=MATCHER_BYTES)
+            verify_matcher(temporary)
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
@@ -211,18 +254,49 @@ def _python_version(executable):
     return None
 
 
-def _bootstrap_python():
-    """Reuse a compatible interpreter; do not install or modify system Python."""
+def _bootstrap_candidates():
+    """Find installed CPythons, keeping separate executable identities."""
     maximum = (3, 12) if sys.platform == "darwin" and platform.machine() == "x86_64" else (3, 13)
     candidates = [Path(sys.executable)]
-    for minor in range(maximum[1], 9, -1):
-        found = shutil.which(f"python3.{minor}")
+    names = [f"python3.{minor}" for minor in range(maximum[1], 9, -1)] + ["python3", "python"]
+    for name in names:
+        found = shutil.which(name)
         if found:
             candidates.append(Path(found))
+    # which() only finds the first executable with a given name. Another
+    # installation of the same Python version may have different library-load
+    # permissions, so also consider later absolute PATH entries.
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        directory = Path(entry)
+        if not entry or not directory.is_absolute():
+            continue
+        for name in names:
+            candidate = directory / (name + ".exe" if os.name == "nt" else name)
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                candidates.append(candidate)
+    available, seen = [], set()
     for candidate in dict.fromkeys(candidates):
+        try:
+            identity = str(candidate.resolve())
+        except (OSError, RuntimeError):
+            continue
+        if identity in seen:
+            continue
+        seen.add(identity)
         version = _python_version(candidate)
         if version and (3, 10) <= version <= maximum:
-            return candidate, version
+            available.append((candidate, version))
+        if len(available) == 8:
+            break
+    return available
+
+
+def _bootstrap_python():
+    """Compatibility helper returning the first version-compatible candidate."""
+    candidates = _bootstrap_candidates()
+    if candidates:
+        return candidates[0]
+    maximum = (3, 12) if sys.platform == "darwin" and platform.machine() == "x86_64" else (3, 13)
     raise RuntimeError(f"自动安装需要兼容的 Python 3.10–3.{maximum[1]}；可通过 {PYTHON_ENV} 指定已有模型环境")
 
 
@@ -274,11 +348,19 @@ def _venv_python(path: Path) -> Path:
     return path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def _pip(python, index, *packages):
+def _pip(python, index, *packages, _quiet=False):
     subprocess.run([str(python), "-m", "pip", "--isolated", "--disable-pip-version-check",
                     "--cache-dir", str(user_cache() / "packages"),
                     "install", "--only-binary=:all:", "--index-url", index, *packages],
-                   stdout=sys.stderr, check=True)
+                   stdout=subprocess.DEVNULL if _quiet else sys.stderr,
+                   stderr=subprocess.DEVNULL if _quiet else None, check=True)
+
+
+def _runtime_key(bootstrap, version, flavor, torch_version):
+    # A signed/hardened host Python and a normal Python may share a version.
+    # Do not reuse or overwrite one interpreter's broken venv for the other.
+    identity = hashlib.sha256(os.fsencode(str(bootstrap.resolve()))).hexdigest()[:12]
+    return f"py{version[0]}{version[1]}-{platform.machine()}-{flavor}-torch{torch_version}-{identity}"
 
 
 def _environment(offline, device="auto"):
@@ -291,49 +373,75 @@ def _environment(offline, device="auto"):
     present = Path(sys.executable)
     local_device = _probe(present)
     flavor = "cpu" if device in {"cpu", "mps"} and sys.platform != "darwin" else _wheel_flavor()
-    if local_device and (offline or local_device != "cpu" or flavor in {"cpu", "macos"}):
+    acceptable = lambda result: result and (offline or result != "cpu" or flavor in {"cpu", "macos"})
+    if acceptable(local_device):
         return present
+    runtime = user_cache() / "runtime"
+    fallback = present if local_device else None
+    # Reuse a successfully probed cache even online, rather than rebuilding it
+    # with a currently selected but incompatible application-hosted Python.
+    for prefix in sorted(runtime.glob("py*-torch*")):
+        if not prefix.is_dir():
+            continue
+        cached = _venv_python(prefix)
+        result = _probe(cached)
+        if acceptable(result):
+            return cached
+        if result and fallback is None:
+            fallback = cached
     if offline:
-        runtime = user_cache() / "runtime"
-        for prefix in sorted(runtime.glob("py*-torch*")):
-            cached = _venv_python(prefix)
-            if _probe(cached):
-                return cached
         raise RuntimeError(f"离线模式缺少兼容环境，请通过 {PYTHON_ENV} 选择已装好依赖的 Python")
-    bootstrap, version = _bootstrap_python()
+    candidates = _bootstrap_candidates()
+    # Probe already installed alternatives before downloading any packages.
+    for bootstrap, _ in candidates:
+        if bootstrap == present:
+            continue
+        result = _probe(bootstrap)
+        if acceptable(result):
+            return bootstrap
+        if result and fallback is None:
+            fallback = bootstrap
     old_mac = flavor == "macos" and platform.machine() == "x86_64"
     torch_version = "2.2.2" if old_mac else TORCH
-    key = f"py{version[0]}{version[1]}-{platform.machine()}-{flavor}-torch{torch_version}"
-    prefix = user_cache() / "runtime" / key
-    candidate = _venv_python(prefix)
-    with locked(prefix.parent / (key + ".lock")):
-        if _probe(candidate):
-            return candidate
-        if offline:
-            raise RuntimeError(f"离线模式缺少兼容环境，请通过 {PYTHON_ENV} 选择已装好依赖的 Python")
-        subprocess.run([str(bootstrap), "-I", "-m", "venv", str(prefix)], check=True,
-                       stdout=sys.stderr)
-        index = PYPI if flavor == "macos" else "https://download.pytorch.org/whl/" + flavor
-        if sys.platform == "linux" and platform.machine().lower() in {"arm64", "aarch64"} and flavor == "cpu":
-            index = PYPI
-        _pip(candidate, PYPI, "numpy==1.26.4" if old_mac else f"numpy=={NUMPY}", f"Pillow=={PILLOW}")
+    for number, (bootstrap, version) in enumerate(candidates, 1):
+        key = _runtime_key(bootstrap, version, flavor, torch_version)
+        prefix = runtime / key
+        candidate = _venv_python(prefix)
         try:
-            _pip(candidate, index, f"torch=={torch_version}")
-        except subprocess.CalledProcessError:
-            if not flavor.startswith("cu"):
-                raise
-            if local_device:
-                print("CUDA 环境准备失败，使用现有 CPU 环境", file=sys.stderr)
-                return present
-            print("CUDA 运行包不可用，尝试官方 CPU 运行包", file=sys.stderr)
-            _pip(candidate, "https://download.pytorch.org/whl/cpu", f"torch=={TORCH}")
-        if not _probe(candidate):
-            raise RuntimeError(f"自动准备的环境未通过推理运行测试，可通过 {PYTHON_ENV} 指定兼容解释器")
-        try:
-            _pip(candidate, PYPI, "faiss-cpu==1.11.0.post1")
-        except subprocess.CalledProcessError:
-            print("此平台缺少 FAISS 预编译包，精确检索仍可用", file=sys.stderr)
-    return candidate
+            with locked(prefix.parent / (key + ".lock")):
+                if _probe(candidate):
+                    return candidate
+                print(f"正在准备候选 Python {number} 的隔离模型环境", file=sys.stderr)
+                subprocess.run([str(bootstrap), "-I", "-m", "venv", str(prefix)], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                index = PYPI if flavor == "macos" else "https://download.pytorch.org/whl/" + flavor
+                if sys.platform == "linux" and platform.machine().lower() in {"arm64", "aarch64"} and flavor == "cpu":
+                    index = PYPI
+                _pip(candidate, PYPI, "numpy==1.26.4" if old_mac else f"numpy=={NUMPY}", f"Pillow=={PILLOW}", _quiet=True)
+                try:
+                    _pip(candidate, index, f"torch=={torch_version}", _quiet=True)
+                except subprocess.CalledProcessError:
+                    if not flavor.startswith("cu"):
+                        raise
+                    print("候选 CUDA 运行包不可用，尝试官方 CPU 运行包", file=sys.stderr)
+                    _pip(candidate, "https://download.pytorch.org/whl/cpu", f"torch=={TORCH}", _quiet=True)
+                if not _probe(candidate):
+                    raise RuntimeError("Candidate model runtime probe failed")
+                try:
+                    _pip(candidate, PYPI, "faiss-cpu==1.11.0.post1", _quiet=True)
+                except subprocess.CalledProcessError:
+                    print("此候选缺少可用的 FAISS 预编译包，精确检索仍可用", file=sys.stderr)
+                return candidate
+        except PermissionError:
+            raise RuntimeError("模型缓存不可写；请使用获准的缓存目录") from None
+        except (OSError, subprocess.SubprocessError, RuntimeError):
+            # Never print a failed command, interpreter path, package diagnostics
+            # or application signing identifiers. No system settings are changed.
+            print(f"候选 Python {number} 的安装或实际运行检查失败，尝试下一个兼容解释器", file=sys.stderr)
+    if fallback is not None:
+        print("加速环境未能准备，使用已通过运行检查的 CPU 环境", file=sys.stderr)
+        return fallback
+    raise RuntimeError(f"可用 Python 候选均未通过模型环境检查；请通过 {PYTHON_ENV} 指定兼容环境")
 
 
 def prepare(weights=None, offline=False, device="auto") -> tuple[Path, Path]:
@@ -345,12 +453,61 @@ def prepare(weights=None, offline=False, device="auto") -> tuple[Path, Path]:
     return _environment(offline, device=device), weight_file
 
 
-if __name__ == "__main__":
+def prepare_enhanced(weights=None, matcher_weights=None, offline=False, device="auto"):
+    if os.environ.get("COPYNCE_OFFLINE", "").strip().lower() in {"1", "true", "yes"}:
+        offline = True
+    python, descriptor = prepare(weights, offline=offline, device=device)
+    return python, descriptor, _matcher_weights(matcher_weights, offline)
+
+
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights", type=Path)
+    parser.add_argument("--matcher-weights", type=Path)
+    parser.add_argument("--quality", choices=("fast", "enhanced", "deep"), default="fast")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
+    parser.add_argument("--build-sn-index", type=Path, metavar="NEW_DIR",
+                        help="从明确选定的独立背景图片建立私有SN索引")
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--provenance", default="user-selected-independent-background")
+    parser.add_argument("paths", type=Path, nargs="*")
     args = parser.parse_args()
-    python, weights = prepare(args.weights, args.offline, args.device)
-    print(json.dumps({"python": str(python), "weights": str(weights)}, ensure_ascii=False))
+    if args.build_sn_index:
+        if not args.paths:
+            parser.error("建立SN索引需要明确选择背景图片或目录")
+        if args.quality != "fast" or args.matcher_weights:
+            parser.error("建立背景索引只使用Descriptor，不需要Matcher参数")
+        python, weights = prepare(args.weights, args.offline, args.device)
+        req = dict(paths=list(map(str, args.paths)), weights=str(weights), output_dir=str(args.build_sn_index),
+                   device=args.device, batch_size=args.batch_size, provenance=args.provenance)
+        code = ("import json,sys;from pathlib import Path;"
+                "sys.path.insert(0,sys.argv[1]);from copynce_sn import build_index;"
+                "r=json.load(sys.stdin);r['paths']=list(map(Path,r['paths']));"
+                "r['weights']=Path(r['weights']);r['output_dir']=Path(r['output_dir']);"
+                "m=build_index(**r);print(json.dumps({'background_index_created':True,"
+                "'image_count':m.get('image_count',m.get('count'))}))")
+        result = subprocess.run([str(python), "-c", code, str(Path(__file__).resolve().parent)],
+                                input=json.dumps(req), capture_output=True, text=True, encoding="utf-8")
+        if result.returncode:
+            print("背景索引建立失败；检查独立背景图片、输出位置与模型环境。", file=sys.stderr)
+            return 2
+        print(result.stdout.strip())
+        return 0
+    if args.paths:
+        parser.error("图片路径仅用于 --build-sn-index")
+    if args.quality == "fast":
+        if args.matcher_weights:
+            parser.error("--matcher-weights 需要 --quality enhanced 或 deep")
+        python, weights = prepare(args.weights, args.offline, args.device)
+        result = {"python": str(python), "weights": str(weights)}
+    else:
+        python, weights, matcher = prepare_enhanced(args.weights, args.matcher_weights, args.offline, args.device)
+        result = {"python": str(python), "weights": str(weights), "matcher_weights": str(matcher)}
+    print(json.dumps(result, ensure_ascii=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 

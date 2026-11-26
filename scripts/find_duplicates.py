@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 CHUNK_SIZE = 1024 * 1024
 DEFAULT_EXTENSIONS = (
     ".jpg", ".jpeg", ".jfif", ".png", ".apng", ".gif", ".webp", ".bmp",

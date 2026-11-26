@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import copynce_cloud as cloud
@@ -134,3 +135,72 @@ class ServerTests(unittest.TestCase):
                         await call("find_similar_images", {"directory": "../outside"})
         with mock.patch.dict(os.environ, {"COPYNCE_PYTHON": sys.executable}):
             asyncio.run(exercise())
+
+
+    def test_enhanced_info_verifies_models_and_hides_auxiliary_paths(self):
+        matcher=self.home/"matcher"
+        matcher.write_bytes(b"fixture")
+        background=self.home/"background-index"
+        background.mkdir()
+        self.write_config(matcher_weights=str(matcher),sn_index=str(background))
+        manifest=dict(fingerprint="a"*64,schema_version=1,dimension=512,images=5,pipeline=cloud.SN_GLOBAL_PIPELINE)
+        modules={"copynce_matcher":SimpleNamespace(OFFICIAL_SHA256=cloud.MATCHER_WEIGHTS_SHA256),
+                 "copynce_sn":SimpleNamespace(GLOBAL_PIPELINE=cloud.SN_GLOBAL_PIPELINE,inspect_index=lambda *a,**kw:manifest,load_index=lambda *a,**kw:SimpleNamespace(manifest=manifest))}
+        with mock.patch.dict(sys.modules,modules),mock.patch.object(server,"_hash_matches",return_value=True):
+            info=server.get_info(server.load_settings(self.config))
+        self.assertEqual(info["supported_profiles"],["fast","enhanced","deep"])
+        self.assertEqual(info["enhancement"]["sn_index_fingerprint"],"a"*64)
+        self.assertNotIn(str(background),json.dumps(info))
+        self.assertNotIn(str(matcher),json.dumps(info))
+        self.assertEqual(info["image_roots"],[str(self.images)])
+
+    def test_enhanced_profile_fails_without_resources_and_never_downgrades(self):
+        settings=server.load_settings(self.config)
+        with self.assertRaisesRegex(ValueError,"verified Matcher"):
+            server.scan_sync(settings,".",profile="enhanced")
+        with self.assertRaises(ValueError):
+            server.require_profile(settings,"unknown")
+
+    def test_upload_job_resources_come_only_from_server_settings(self):
+        import copynce_remote_jobs as jobs
+        settings=server.Settings(self.weights,(self.images,),self.cache,"cpu",8,40000000,
+                                 self.home/"matcher",self.home/"background-index")
+        with mock.patch.object(server,"require_profile") as validate, \
+             mock.patch.object(jobs,"create_job",return_value={"directory":"/path/to/job/images"}) as create:
+            server.prepare_upload_job(settings,"a"*32,"enhanced","b"*64)
+        validate.assert_called_once_with(settings,"enhanced","b"*64)
+        cfg=create.call_args.args[1]
+        self.assertEqual(cfg["sn_index"],str(settings.sn_index))
+        self.assertEqual(cfg["matcher_weights"],str(settings.matcher_weights))
+        self.assertNotIn("image_roots",cfg)
+        self.assertTrue(create.call_args.kwargs["allow_auxiliary"])
+        with self.assertRaises(TypeError):
+            server.prepare_upload_job(settings,"a"*32,"enhanced","b"*64,sn_index="/path/to/unapproved")
+
+
+    def test_stage_budgets_and_indexed_mode_rejected_before_resource_loading(self):
+        settings=server.load_settings(self.config)
+        with mock.patch.object(server,"require_profile") as resources:
+            for opts in ({"top_k":20001},{"candidate_k":257},{"matcher_budget":100001},
+                         {"local_view_pairs":9},{"sn_extra_budget":10001},{"mode":"indexed"}):
+                with self.subTest(opts=opts),self.assertRaises(ValueError):
+                    server.scan_sync(settings,".",profile="enhanced",**opts)
+            resources.assert_not_called()
+
+    def test_new_sn_fingerprint_requires_full_arrays_validation_before_ready(self):
+        settings=server.Settings(self.weights,(self.images,),self.cache,matcher_weights=self.home/"matcher",sn_index=self.home/"sn")
+        manifest=dict(fingerprint="f"*64,schema_version=1,dimension=512,images=5,pipeline=cloud.SN_GLOBAL_PIPELINE)
+        loader=mock.Mock(side_effect=ValueError("invalid array data"))
+        module=SimpleNamespace(GLOBAL_PIPELINE=cloud.SN_GLOBAL_PIPELINE,inspect_index=lambda *a,**kw:manifest,load_index=loader)
+        with mock.patch.dict(sys.modules,{"copynce_sn":module,"copynce_matcher":SimpleNamespace(OFFICIAL_SHA256=cloud.MATCHER_WEIGHTS_SHA256)}), \
+             mock.patch.object(server,"_hash_matches",return_value=True),mock.patch.object(server,"VALIDATED_SN",set()):
+            info=server.get_info(settings)
+        loader.assert_called_once()
+        self.assertFalse(info["enhancement"]["ready"])
+        self.assertEqual(info["supported_profiles"],["fast"])
+
+
+    def test_deep_whole_only_rejected_before_runtime_resources(self):
+        with mock.patch.object(server,"require_profile") as resources,self.assertRaisesRegex(ValueError,"local comparison"):
+            server.scan_sync(server.load_settings(self.config),".",profile="deep",tiles=False)
+        resources.assert_not_called()

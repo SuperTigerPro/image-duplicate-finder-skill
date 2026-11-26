@@ -34,6 +34,16 @@ def parse(argv):
     p.add_argument("paths", type=Path, nargs="*")
     p.add_argument("--backend", choices=("local", "cloud"), default="local")
     p.add_argument("--weights", type=Path, help="指定官方权重文件")
+    p.add_argument("--quality", choices=("fast", "enhanced", "deep"), default="fast",
+                   help="fast=兼容旧版；enhanced=官方SN与Matcher；deep=官方代码LCE")
+    p.add_argument("--matcher-weights", type=Path, help="本机官方 Matcher 权重；缺省按需下载")
+    p.add_argument("--sn-index", type=Path, help="仓库外的独立 SN 背景索引目录（本机）")
+    p.add_argument("--candidate-k", type=core.positive_integer, default=32)
+    p.add_argument("--matcher-budget", type=core.positive_integer, default=10000)
+    p.add_argument("--local-view-pairs", type=core.positive_integer, default=2)
+    p.add_argument("--sn-extra-budget", type=int, default=1000)
+    p.add_argument("--matcher-threshold", type=cosine, default=.5,
+                   help="Matcher分类分数门槛，0～1；0.5是未校准起点")
     p.add_argument("--offline", action="store_true", help="仅使用本机已有依赖与权重")
     p.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
     p.add_argument("--batch-size", type=core.positive_integer, default=8)
@@ -57,6 +67,24 @@ def parse(argv):
     actions.add_argument("--cleanup-job", metavar="JOB_ID", help="重连后确认清理指定的自有临时任务（匿名任务ID）")
     p.add_argument("--upload-original", action="store_true", help="明确传输原文件字节（包含EXIF等元数据）；默认上传去元数据推理副本")
     args = p.parse_args(argv)
+    if not 0 <= args.matcher_threshold <= 1:
+        p.error("--matcher-threshold 须在0至1之间")
+    if args.sn_extra_budget < 0:
+        p.error("--sn-extra-budget 不能为负")
+    for value, maximum, label in ((args.candidate_k, 256, "candidate-k"),
+                                  (args.matcher_budget, 100000, "matcher-budget"),
+                                  (args.local_view_pairs, 8, "local-view-pairs"),
+                                  (args.sn_extra_budget, 10000, "sn-extra-budget")):
+        if value > maximum:
+            p.error(f"--{label} 超过安全上限{maximum}")
+    if args.quality == "fast" and (args.matcher_weights or args.sn_index):
+        p.error("Matcher 权重与 SN 索引仅用于 --quality enhanced 或 deep")
+    if args.quality != "fast" and args.threshold != .75:
+        p.error("增强模式请用 --matcher-threshold；--threshold 仅用于 fast 的余弦分数")
+    if args.quality != "fast" and args.search_mode == "indexed":
+        p.error("增强模式目前使用精确分块候选生成，请用 --search-mode exact 或 auto")
+    if args.quality == "deep" and args.whole_only:
+        p.error("deep 包含官方局部裁块，不能与 --whole-only 混用")
     if args.top_k > 20000:
         p.error("--top-k 超过模型安全上限20000")
     remote = args.remote_directory is not None
@@ -69,7 +97,8 @@ def parse(argv):
     if args.backend == "cloud":
         if not args.profile:
             p.error("请用 --profile 指定本机的私有 SSH 配置")
-        if args.weights or args.offline or args.device != "auto" or args.batch_size != 8 or args.max_pixels != 40_000_000:
+        if (args.weights or args.matcher_weights or args.sn_index or args.offline or args.device != "auto"
+                or args.batch_size != 8 or args.max_pixels != 40_000_000):
             p.error("--weights、--offline、--device、--batch-size 和 --max-pixels 仅用于本地模型")
         if cleaning:
             if args.paths or remote or args.output_dir:
@@ -148,10 +177,18 @@ def _worker():
 
 def local_scan(records, args, options):
     setup = _module("copynce_setup")
-    python, weights = setup.prepare(weights=args.weights, offline=args.offline, device=args.device)
+    if args.quality == "fast":
+        python, weights = setup.prepare(weights=args.weights, offline=args.offline, device=args.device)
+        enhanced = {}
+    else:
+        if args.sn_index is None:
+            raise ValueError("增强模式需要独立背景索引：先用 copynce_setup.py --build-sn-index 准备，再指定 --sn-index")
+        python, weights, matcher = setup.prepare_enhanced(
+            weights=args.weights, matcher_weights=args.matcher_weights, offline=args.offline, device=args.device)
+        enhanced = dict(matcher_weights=str(matcher), sn_index=str(args.sn_index.expanduser().absolute()))
     req = {"paths": list(records), "file_stamps": {name: item.stamp for name, item in records.items()},
            "weights": str(weights), "cache": str(setup.user_cache() / "descriptors.sqlite3"),
-           "options": dict(options, device=args.device, batch_size=args.batch_size, max_pixels=args.max_pixels)}
+           "options": dict(options, **enhanced, device=args.device, batch_size=args.batch_size, max_pixels=args.max_pixels)}
     command = [str(python), str(Path(__file__).resolve()), "--local-worker"]
     proc = subprocess.run(command, input=json.dumps(req), capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
@@ -181,6 +218,9 @@ def main(argv=None):
             return 0
         opts = dict(tiles=not args.whole_only, threshold=args.threshold, top_k=args.top_k,
                     mode=args.search_mode, recursive=args.recursive)
+        stages = dict(profile=args.quality, candidate_k=args.candidate_k, matcher_budget=args.matcher_budget,
+                      local_view_pairs=args.local_view_pairs, sn_extra_budget=args.sn_extra_budget,
+                      matcher_threshold=args.matcher_threshold) if args.quality != "fast" else {}
         remote = args.remote_directory is not None
         scanner = None if remote else select_inputs(args)
         records = {} if remote else {str(item.path): item for item in scanner.files}
@@ -193,22 +233,24 @@ def main(argv=None):
                               "files": len(records), "bytes": sum(r.size for r in records.values()),
                               "errors": scanner.errors, "uploaded": False}, ensure_ascii=True))
             return int(bool(scanner.errors))
-        if not remote and not records:
+        if not remote and not records and args.quality == "fast":
             raw = empty_result()
         elif args.backend == "local":
-            raw = local_scan(records, args, opts)
+            raw = local_scan(records, args, dict(opts, **stages))
         else:
             policy = {"require_strict_remote": True} if remote else {}
             if args.allow_upload:
                 policy["file_stamps"] = {name: record.stamp for name, record in records.items()}
                 policy["upload_original"] = args.upload_original
+            if stages:
+                policy.update({k: v for k, v in stages.items() if k != "profile"}, model_profile=args.quality)
             raw = _module("copynce_cloud").cloud_scan(args.profile, paths=[r.path for r in records.values()],
                                                     remote_directory=args.remote_directory,
                                                     allow_upload=args.allow_upload, **opts, **policy)
         if records and any(row[f"path_{side}"] not in records for row in raw["matches"] for side in ("a", "b")):
             raise ValueError("返回了本次输入范围之外的图片路径")
         inputs = [args.remote_directory] if remote else scanner.roots
-        options = dict(opts, source="remote-directory" if remote else "local-files")
+        options = dict(opts, **stages, source="remote-directory" if remote else "local-files")
         if not remote:
             options.update(include_hidden=args.include_hidden,
                            extensions=None if args.extensions is None else sorted(args.extensions))

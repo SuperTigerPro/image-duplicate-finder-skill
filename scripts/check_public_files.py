@@ -22,8 +22,10 @@ references/universal-agent-prompt.md references/copynce.md requirements-pixels.t
 scripts/check_public_files.py scripts/find_duplicates.py scripts/image_similarity.py scripts/tool_adapter.py
 scripts/copynce_cli.py scripts/copynce_cloud.py scripts/copynce_engine.py scripts/copynce_model.py
 scripts/copynce_remote_jobs.py scripts/copynce_report.py scripts/copynce_server.py scripts/copynce_setup.py
+scripts/copynce_matcher.py scripts/copynce_sn.py scripts/copynce_pipeline.py
 tests/test_check_public_files.py tests/test_copynce_cli.py tests/test_copynce_cloud.py
 tests/test_copynce_engine.py tests/test_copynce_server.py tests/test_copynce_setup.py tests/test_copynce_model.py
+tests/test_copynce_matcher.py tests/test_copynce_sn.py tests/test_copynce_pipeline.py tests/test_copynce_remote_jobs.py
 tests/test_find_duplicates.py tests/test_image_similarity.py tests/test_skill_package.py
 tests/test_tool_adapter.py third_party/CopyNCE-LICENSE
 """.split())
@@ -37,7 +39,7 @@ PUBLIC_DOMAINS = {
     "www.apache.org", "www.w3.org", "pypi.org", "files.pythonhosted.org",
     "pytorch.org", "docs.pytorch.org", "download.pytorch.org",
     "drive.google.com", "drive.usercontent.google.com", "docs.google.com",
-    "modelcontextprotocol.io", "man.openbsd.org",
+    "modelcontextprotocol.io", "man.openbsd.org", "arxiv.org",
 }
 EXAMPLE_DOMAINS = ("example.com", "example.org", "example.net", "example", "invalid", "test")
 CHECKS = {

@@ -160,3 +160,20 @@ pair_id,similarity_score,threshold,pixel_identical,path_a,path_b,size_a_bytes,si
 近似检索或设置返回上限的任务可以正常退出 0。仅当 `all_matches_reported` 为真时才称为“本次范围与阈值下的完整候选清单”。本机原图可读时，PNG 预览最多展示 12 对并绘制匹配框；宿主缺少 Pillow 时可使用 HTML 预览。服务器已有图库只返回路径与区域，无需下载原图。CSV、JSON、Markdown 记录本次返回的完整图对清单。
 
 模型余弦分数范围为-1至1，不是概率，不与similar模式0～100分混用。完整精确检索只覆盖当前生成的整图和固定裁块，不承诺任意裁剪或单图内部克隆的召回。模型报告拒绝保存在Skill目录或任何Git工作树；云端终端输出统计，完整私有报告含原图路径，禁止公开上传。临时传图结果映射回本机原始路径，不保留远端任务配置和服务器错误原文。
+
+## 增强模型模式（schema_version = 4）
+
+增强/深查仍读取 `matches`，`score` 是 `matcher_score` 的兼容别名，`score_type=classifier_sigmoid`。每对另有 `descriptor_cosine`（整图）、`local_cosine`（最高视图余弦）、`sn_a_to_b`、`sn_b_to_a`、双向Matcher分类分数、候选通道、复核视图策略及窗口来源。SN可能超出[-1,1]，不会减到Matcher分数；分类分数未进行领域概率校准。
+
+- `files_complete`：文件读取和身份检查无错误。
+- `budget_complete`：计划候选均已尝试，无预算待处理或候选安全截断；失败另计。
+- `complete`：无错误且预算完整。预算耗尽时CLI返回1。
+- `exhaustive`：所有可能无序图对都成功经过本档Matcher核验；Descriptor全量打分不等于此项为真。
+- `truncated`：已核验命中超过最终top_k，与预算耗尽独立。
+- `all_matches_reported`：任务无错误、核验全覆盖且返回未截断。
+
+`stage_totals` 分别记录 `descriptor_pairs_assessed`、整图/局部定向召回数、`base_candidates`、`extra_candidates`、`planned_candidates`、`matcher_attempted`、`matcher_verified`、`matcher_failed`、`matcher_pending`、实际视图比较次数及每图覆盖情况。满足计划数=已成功核验+失败+待核验；未召回的图对不会被虚构为Matcher阴性。
+
+顶层记录两份权重SHA、匿名SN索引指纹、SN参数、实际阶段设备、FP32和流程版本。背景provenance原文、私有资源路径及SSH认证字段不写入模型报告。增强CSV增加各阶段分数列；预览标注Matcher分数。窗口对应参与比较的区域，不代表精确复制边界；深查窗口来源在 `box_source` 中注明。
+
+持久本机/服务器图库的已核验结果可复用：`matcher_cache_hits`、`matcher_new_verified`、`matcher_attempted_new` 分列于stage_totals；新增预算只限制最后一项。每个命中可标 `matcher_cache_hit` 及其原计算设备；顶层 `matcher_cache_devices` 和 `matcher_cache_policy` 记录缓存来源。全部命中时本次Matcher设备为cache。每次重算SN，已修改输入不复用旧核验。上传任务缓存与图片一起清理，不支持跨上传任务恢复。

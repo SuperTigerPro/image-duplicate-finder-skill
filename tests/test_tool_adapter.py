@@ -41,7 +41,9 @@ class ToolAdapterTests(Fixture):
         self.assertFalse(parameters["additionalProperties"])
         self.assertEqual(set(parameters["required"]), set(self.request()))
         self.assertEqual(set(parameters["properties"]), set(self.request()) | {"similarity_threshold", "backend",
-                         "model_threshold", "whole_only", "search_mode", "top_k", "remote_profile", "remote_directory"})
+                         "model_threshold", "whole_only", "search_mode", "top_k", "remote_profile", "remote_directory",
+                         "model_quality", "sn_background", "candidate_k", "matcher_budget", "local_view_pairs",
+                         "sn_extra_budget", "matcher_threshold"})
         self.assertEqual(parameters["properties"]["similarity_threshold"]["default"], 90)
         self.assertEqual(parameters["properties"]["mode"]["enum"], ["exact", "pixels", "similar", "copynce"])
 
@@ -81,6 +83,29 @@ class ToolAdapterTests(Fixture):
         self.assertIn("--offline", arguments)
         self.assertIn("--whole-only", arguments)
         self.assertNotIn("--allow-upload", arguments)
+
+    def test_enhanced_background_is_bound_by_host_not_model_paths(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import tool_adapter as adapter
+        import copynce_cli
+        req = self.request(mode="copynce", model_quality="enhanced", sn_background="background-1")
+        approved = self.root / "background"
+        def finish(arguments):
+            out = Path(arguments[arguments.index("--output-dir") + 1]);out.mkdir(parents=True)
+            (out / "duplicates.json").write_text('{"schema_version":4,"matches":[]}')
+            return 0
+        kwargs = dict(allow_model=True, sn_indices={"background-1": approved})
+        with mock.patch.object(copynce_cli, "main", side_effect=finish) as execute:
+            result = adapter.run_request(req, [self.images], self.root / "reports", **kwargs)
+        args = execute.call_args.args[0]
+        self.assertTrue(result["ok"])
+        self.assertEqual(args[args.index("--sn-index") + 1], str(approved))
+        self.assertNotIn("--threshold", args)
+        with mock.patch.object(copynce_cli, "main", side_effect=AssertionError("must reject")):
+            for change in ({"sn_background":str(approved)}, {"model_threshold":.75},
+                           {"sn_index":str(approved)}, {"matcher_threshold":True}):
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    adapter.run_request(dict(req, **change), [self.images], self.root / "reports", **kwargs)
 
     def test_json_only_exact_roundtrip_and_reports(self):
         self.write("a.png")

@@ -19,7 +19,7 @@
 
 - **similar（新增）**：静态整图相似检测，覆盖常见缩放、重新压缩和轻微亮度变化，用户只调相似度门槛，内部指标自动联动。
 
-- **copynce**：使用官方 Descriptor 权重比较整图与重叠的局部裁块，输出疑似复用图对、余弦分数及两侧候选窗口，供人工核对。
+- **copynce**：推荐增强模式，使用 Descriptor 整图/局部召回、官方 SN 与独立 Matcher 复核；提供快速兼容档和官方代码 LCE 深查档。分开输出余弦、双向 SN、分类分数和证据窗口。
 
 ### 怎么选
 
@@ -140,15 +140,25 @@ Windows 使用 .venv\Scripts\python.exe 执行相同参数。
 
 ### 5. 模型查重
 
+增强模式需要独立、获准使用的背景图片集。首次建立索引后可重复使用：
+
 ~~~bash
-python3 scripts/find_duplicates.py "/选定图库" --mode copynce --backend local --output-dir "/可写位置/模型报告"
+python3 scripts/copynce_setup.py --build-sn-index "/path/to/private-background/index" \
+  "/path/to/approved-background-images"
+python3 scripts/find_duplicates.py "/path/to/selected-gallery" --mode copynce --backend local \
+  --quality enhanced --sn-index "/path/to/private-background/index" \
+  --summary-only --output-dir "/path/to/private-reports/enhanced-001"
 ~~~
 
-首次运行会自动寻找兼容 Python，在用户缓存目录创建隔离环境，从官方来源下载并校验权重。CPU、CUDA 和 Apple Silicon MPS 共用约 87.5 MB 的同一份权重；依赖另占空间。实际推理自检后选择设备，显存不足先减小批量，再回退本机 CPU，不改系统驱动，也不自动切换云端。
+首次按需寻找兼容 Python、准备隔离依赖并下载两份固定哈希的官方权重：Descriptor约87.5MB、Matcher约86.7MB。CUDA、Apple MPS和CPU使用相同模型与FP32流程，实际推理自检后选择设备；显存不足减小批量并可回退本机CPU，不改系统驱动或自动切换云端。
 
-默认比较整图和固定局部裁块，`--whole-only` 只比较整图。**CopyNCE 是实验性候选筛查**；`--threshold 0.75` 是需要领域校准的起始余弦门槛，不是75%的重复概率。高分和候选窗口不能替代严格重复核验或人工来源审查。官方公开基础权重的范围及局限见 [CopyNCE 上游说明](https://github.com/eddielyc/CopyNCE#fine-tuning)。
+`--quality enhanced` 合并每张图的整图/局部候选，官方查询侧SN分配额外候选预算，Matcher复核整图和少量证据窗口。`--quality deep` 对相同候选执行双向官方代码LCE，计算量更高；不能与 `--whole-only` 混用。旧命令省略质量档位时保持 `fast`，只使用Descriptor最高余弦。
 
-模型报告强制写在仓库及所有 Git 工作树之外。`--summary-only` 只向终端输出统计，完整路径保留在私有报告。本机离线、服务器部署、严格图库边界、默认去元数据传输、取消与重连清理见[模型操作指南](references/copynce.md)。
+SN使用独立背景特征，不训练模型、不默认使用待查图库；索引必须在仓库外。背景与查询内容及完整RGB像素重合时排除，来源组隔离需要用户提供来源信息。SN不会改变单个查询的候选排名，也不直接修正Matcher分数。Matcher默认0.5是未校准起点，与快速模式0.75、similar的90和旧Copydays阈值分别独立。
+
+增强报告为schema4，分别记录召回、计划、成功核验、失败及待核验数量；达到新增复核预算而有候选未处理时返回1，输出top_k截断单列。本机/服务器已有图库可重跑复用已核验缓存继续，上传任务仍在结束后清理全部查询缓存。**模型只提供疑似复用候选**，高分和窗口不能替代严格重复核验或人工来源审查。公开基础模型的适用边界见 [CopyNCE上游说明](https://github.com/eddielyc/CopyNCE#fine-tuning)。
+
+本机离线、背景构建、服务器API2部署、传图前能力校验、默认去元数据传输和取消清理见[模型操作指南](references/copynce.md)。真实连接配置、背景特征、报告与日志均留在所有Git工作树之外。
 
 ### 常用参数
 

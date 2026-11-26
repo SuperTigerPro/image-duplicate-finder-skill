@@ -18,7 +18,9 @@ except ImportError:
 
 MAX_REQUEST_BYTES = 1024 * 1024
 FIELDS = {"paths", "mode", "output_dir", "recursive", "include_hidden"}
-MODEL_FIELDS = {"backend", "model_threshold", "whole_only", "search_mode", "top_k", "remote_profile", "remote_directory"}
+MODEL_FIELDS = {"backend", "model_threshold", "whole_only", "search_mode", "top_k", "remote_profile", "remote_directory",
+                "model_quality", "sn_background", "candidate_k", "matcher_budget", "local_view_pairs",
+                "sn_extra_budget", "matcher_threshold"}
 OPTIONAL_FIELDS = {"similarity_threshold"} | MODEL_FIELDS
 
 
@@ -27,7 +29,7 @@ def inside(path, root):
 
 
 def run_request(request, allowed_roots, report_root, *, allow_model=False, remote_profiles=None,
-                remote_roots=None, allow_upload=False, model_offline=False):
+                remote_roots=None, allow_upload=False, model_offline=False, sn_indices=None):
     """Host-controlled roots cannot be expanded by model-supplied JSON."""
     if (not isinstance(request, dict) or not FIELDS <= set(request)
             or not set(request) <= FIELDS | OPTIONAL_FIELDS):
@@ -74,6 +76,10 @@ def run_request(request, allowed_roots, report_root, *, allow_model=False, remot
         arguments.append("--include-hidden")
     if model:
         arguments += ["--backend", backend, "--summary-only"]
+        quality = request.get("model_quality", "fast")
+        if quality not in ("fast", "enhanced", "deep"):
+            raise ValueError("model_quality 必须是 fast、enhanced 或 deep")
+        arguments += ["--quality", quality]
         threshold = request.get("model_threshold", .75)
         if type(threshold) not in (int, float) or not math.isfinite(threshold) or not -1 <= threshold <= 1:
             raise ValueError("model_threshold 必须是 -1 至 1 的有限余弦分数")
@@ -86,7 +92,25 @@ def run_request(request, allowed_roots, report_root, *, allow_model=False, remot
         whole = request.get("whole_only", False)
         if type(whole) is not bool:
             raise ValueError("whole_only 必须是布尔值")
-        arguments += ["--threshold", str(threshold), "--top-k", str(top_k), "--search-mode", search]
+        arguments += ["--top-k", str(top_k), "--search-mode", search]
+        if quality == "fast":
+            if set(request) & {"sn_background", "candidate_k", "matcher_budget", "local_view_pairs", "sn_extra_budget", "matcher_threshold"}:
+                raise ValueError("SN与Matcher参数仅用于 enhanced 或 deep")
+            arguments += ["--threshold", str(threshold)]
+        else:
+            if "model_threshold" in request:
+                raise ValueError("增强模式使用独立 matcher_threshold，不能沿用余弦门槛")
+            match_threshold = request.get("matcher_threshold", .5)
+            if (type(match_threshold) not in (int, float) or not math.isfinite(match_threshold)
+                    or not 0 <= match_threshold <= 1):
+                raise ValueError("matcher_threshold 必须为0至1的有限分类分数")
+            arguments += ["--matcher-threshold", str(match_threshold)]
+            for field in ("candidate_k", "matcher_budget", "local_view_pairs", "sn_extra_budget"):
+                if field in request:
+                    value = request[field]
+                    if type(value) is not int or value < (0 if field == "sn_extra_budget" else 1):
+                        raise ValueError(field + " 的整数范围无效")
+                    arguments += ["--" + field.replace("_", "-"), str(value)]
         if whole:
             arguments.append("--whole-only")
         if backend == "local":
@@ -94,7 +118,15 @@ def run_request(request, allowed_roots, report_root, *, allow_model=False, remot
                 raise ValueError("远端配置仅用于 cloud 模式")
             if model_offline:
                 arguments.append("--offline")
+            if quality != "fast":
+                background = request.get("sn_background")
+                if (not isinstance(background, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", background)
+                        or background not in (sn_indices or {})):
+                    raise ValueError("增强模式需要宿主授权的匿名 sn_background ID")
+                arguments += ["--sn-index", str(sn_indices[background])]
         else:
+            if "sn_background" in request:
+                raise ValueError("云端背景索引由服务器配置绑定，不接受本机背景路径或ID")
             name = request.get("remote_profile")
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
                 raise ValueError("请使用宿主授权的匿名 remote_profile ID")
@@ -143,6 +175,8 @@ def main():
                         help="宿主授权的报告根目录；每次请求须使用其中的新子目录")
     parser.add_argument("--allow-model", action="store_true", help="宿主确认本次允许使用模型和准备其依赖")
     parser.add_argument("--model-offline", action="store_true", help="模型只使用已有环境和权重")
+    parser.add_argument("--sn-index", action="append", default=[], metavar="ID=DIR",
+                        help="宿主绑定的匿名背景ID与仓库外索引目录，不能由模型提供路径")
     parser.add_argument("--remote-profile", action="append", default=[], metavar="ID=FILE",
                         help="宿主授权的匿名ID与仓库外私有profile；不能来自模型参数")
     parser.add_argument("--allow-remote-root", action="append", default=[], metavar="ID=DIR",
@@ -158,6 +192,12 @@ def main():
         request = json.loads(raw.decode("utf-8-sig"))
         profiles = {}
         remote_roots = {}
+        sn_indices = {}
+        for value in options.sn_index:
+            name, sep, value = value.partition("=")
+            if not sep or not value or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+                raise ValueError("sn-index 需要 ID=DIR")
+            sn_indices[name] = Path(value).expanduser().resolve()
         for value in options.remote_profile:
             name, sep, value = value.partition("=")
             if not sep or not value or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
@@ -170,7 +210,7 @@ def main():
             remote_roots.setdefault(name, []).append(value)
         result = run_request(request, roots, report_root, allow_model=options.allow_model,
                              remote_profiles=profiles, remote_roots=remote_roots, allow_upload=options.allow_upload,
-                             model_offline=options.model_offline)
+                             model_offline=options.model_offline, sn_indices=sn_indices)
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
         result = {"ok": False, "exit_code": 2, "report": None,
                   "stdout": "", "stderr": str(exc)}

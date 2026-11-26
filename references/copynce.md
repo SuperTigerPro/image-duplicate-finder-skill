@@ -1,6 +1,14 @@
 # CopyNCE 模型查重
 
-CopyNCE Descriptor 比较静态图片的整图与固定局部裁块，筛出两张图片之间疑似裁剪、拼接或嵌套复用的候选。得分与窗口供人工核对；相似背景、边框或图例可能误报，任意裁剪、很小的嵌图和单张图内部克隆不保证检出。普通查重不需要启用模型。
+CopyNCE 增强流程用 Descriptor 召回整图和局部候选，以官方 SN 分配额外候选预算，再用独立 Matcher 复核图片对。得分与窗口供人工核对；相似背景、边框或图例可能误报，任意裁剪、很小的嵌图和单张图内部克隆不保证检出。普通查重不需要启用模型。
+
+| 质量参数 | 行为 |
+| --- | --- |
+| `--quality fast` | 原有 Descriptor 最高余弦；旧命令省略质量参数时保持此行为 |
+| `--quality enhanced` | Skill 推荐的模型调用：整图和局部召回、官方查询侧 SN、Matcher 双向整图及证据窗口复核 |
+| `--quality deep` | 同一候选流程，改用固定上游代码的双向 LCE；每个无序图对最多70个视图配对 |
+
+增强与深查需要独立背景索引和两份权重。资源缺失时明确失败，不静默降为 fast。
 
 ## 本机模型
 
@@ -8,21 +16,44 @@ CopyNCE Descriptor 比较静态图片的整图与固定局部裁块，筛出两�
 
 ~~~bash
 python3 scripts/find_duplicates.py "/path/to/selected-gallery" --mode copynce --backend local \
+  --quality enhanced --sn-index "/path/to/private-background/index" \
   --summary-only --output-dir "/path/to/private-reports/model-001"
 
 # 离线运行须已有兼容依赖和校验通过的官方权重
 python3 scripts/find_duplicates.py "/path/to/selected-gallery" --mode copynce --backend local \
+  --quality fast \
   --offline --weights "/path/to/private-models/descriptor_vits_224.pth.tar" \
   --summary-only --output-dir "/path/to/private-reports/offline-001"
 ~~~
 
 仅选用模型时才准备运行环境和权重。程序探测兼容 Python、系统和可用后端，选择相应的 PyTorch 安装方式；优先使用可用 NVIDIA CUDA，Apple Silicon Mac 可使用 MPS，没有可用加速后端时使用 CPU。AMD、Intel 或其他显卡不代表当前实现必然支持其加速。设备必须通过实际运算检查；推理时显存不足先减小批量，必要时退回 CPU。可用 `--device cpu` 固定使用 CPU，不自动安装显卡驱动或更改系统 CUDA。
 
-不同设备使用同一份约 87.5 MB 的权重，PyTorch 等依赖另占空间。环境、权重和特征缓存默认放在用户缓存目录。首次准备可能联网下载公共依赖和权重；本机推理不上传图片。`--offline` 禁止自动补下载，缺少依赖或权重时明确失败。可用 `COPYNCE_PYTHON` 指向兼容解释器，用 `COPYNCE_CACHE_DIR` 指定仓库外的缓存位置。
+不同设备使用相同权重：Descriptor 为87,514,773字节，Matcher 为86,733,215字节，PyTorch 等依赖另占空间。模型分阶段运行，并限制 Matcher 批量。环境、权重和特征缓存默认放在用户缓存目录。首次准备可能联网下载公共依赖和权重；本机推理不上传图片。`--offline` 禁止自动补下载，缺少依赖或权重时明确失败。可用 `COPYNCE_PYTHON` 指向兼容解释器，用 `COPYNCE_CACHE_DIR` 指定仓库外的缓存位置。
 
 手工下载时在[官方模型表](https://github.com/eddielyc/CopyNCE#models)选择 **Descriptor / ViT-S / 224×224**；SHA-256 必须为 `829fdf4ae032bac24b4fcc60535cfc3b53026af083b33a0b8c71f1973f2166db`。不得以未校验的其他权重替代。
 
 `--summary-only` 让本机扫描的终端输出仅包含统计；完整路径仍保存在私有报告中。该选项不等于报告已脱敏，向聊天模型回传内容前仍由宿主控制。
+
+## 官方 SN 背景索引与评分
+
+背景集须独立、获准使用，不默认取本次待查图库。可复用已登记且兼容的背景索引；没有时明确选择背景图片并建立私有索引：
+
+~~~bash
+python3 scripts/copynce_setup.py --build-sn-index "/path/to/private-background/index" \
+  --provenance "independent-authorized-background" "/path/to/approved-background-images"
+~~~
+
+至少需要5张去重后可用的背景图；与本次输入重合的文件及完整RGB像素会被排除，排除后仍须至少5张。来源组标签可通过Python接口提供；没有标签时不能保证不同变体属于不同来源，用户仍需选择独立背景集。构建与使用均只读原图，不训练模型。索引以600权限文件和700目录保存在仓库外，含全局FP32特征、内容摘要、模型及预处理版本、来源信息和完整性指纹，不含图片路径。
+
+采用[固定上游代码](https://github.com/eddielyc/CopyNCE/blob/c2223d18abf3289202666a0d2b9db1c3a7f1b483/scripts/run/score_normalization.py)的参数 `alpha=1,start=1,end=5`：Q/R/A逐行L2归一化，查询与背景相似度降序排列，取Python切片 `[1:5]`，从查询与参考的整图余弦减去这4个近邻的平均相似度。SN不是概率，可能超出余弦范围；同一查询的参考排名不变。现有22视图最高余弦保留为独立局部召回通道，不把它减去整图偏置后称为官方SN。
+
+每图整图/局部K候选合并后形成基础集合，不以0.75提前筛除；额外候选按定向SN安排并限制每图份额。SN不直接修正Matcher分数，候选固定且全部完成复核时不会改变Matcher输出。无序图对保留双向SN。候选调度及证据窗口复核是Skill扩展，不是完整论文复现；旧Descriptor的Copydays阈值不能移用于这些新分数。
+
+Matcher采用官方独立ViT-S/224权重，SHA-256为 `dd8dea1c345039bbda303c42457aa3a0389d46fb37ea39506bfb1faddedda1df`；以 `weights_only=True` 读取并严格加载。官方eval已执行sigmoid，输出称为未校准分类分数。增强档比较双向整图及Descriptor选出的少量证据视图后取最大值；不同视图数量的聚合分数需分别校准。
+
+深查采用[公开代码LCE](https://github.com/eddielyc/CopyNCE/blob/c2223d18abf3289202666a0d2b9db1c3a7f1b483/core/models/copy_detector.py#L437-L460)：26查询视图和10参考视图的35种星形配对，目录无序查重执行两个方向，共70种。论文描述的260种组合与当前公开代码不同，本实现不混称。旋转/裁块窗口不是精确复制边界，单纯相似背景仍可能高分。
+
+增强报告使用schema4：分别记录 `descriptor_cosine`、`local_cosine`、`sn_a_to_b`、`sn_b_to_a`、`matcher_score`，顶层 `score_type=classifier_sigmoid`。`files_complete`只表示文件处理完整，`budget_complete`表示计划复核完成；`complete`还要求没有错误。`stage_totals`记录召回、计划、已核验、失败及待核验数量；最终top_k截断与计算预算耗尽分别显示。返回上限不限制内部复核数量。未覆盖所有可能图对时，不能称全部疑似复用均已找到。
 
 ## 私有 SSH 连接
 
@@ -66,6 +97,8 @@ CUDA 构建应与服务器驱动和 Python 兼容，参见 [PyTorch 安装说明
 ~~~json
 {
   "weights": "/path/to/private-models/descriptor_vits_224.pth.tar",
+  "matcher_weights": "/path/to/private-models/matcher_vits_224.pth.tar",
+  "sn_index": "/path/to/private-background/index",
   "image_roots": ["/path/to/approved-gallery"],
   "cache": "/path/to/private-cache/features.sqlite3",
   "device": "auto",
@@ -80,13 +113,15 @@ profile 的 `launcher` 指向远端 Skill 根目录的 `start-mcp`。它默认�
 
 内置服务强制 `image_roots` 边界，拒绝根路径及输入路径经过符号链接，扫描时固定选中文件身份。客户端的远端目录扫描默认要求服务器声明严格图库边界；CLI 不提供放宽此限制的开关。服务使用与本机相同的推理引擎，工作子进程在取消或会话结束时受控回收。
 
+增强客户端传图前协商API2、schema4、两份实际权重哈希、SN实现与背景索引指纹；缺资源或版本不兼容时停止。背景索引是独立只读资源，不加入扫描 `image_roots`，上传任务也不能指定任意背景路径。后台索引在服务器准备或经单独授权传输；允许上传本次图片不等于允许上传背景数据。CPU回退仅改变当前执行地点的设备，不改变数据驻留位置。
+
 ## 图库已经在服务器
 
 指定获准图库内的目录，传查询参数并取回候选。绝对路径须位于 `image_roots` 内；相对路径以第一个获准根目录为基准，`.` 表示该根目录。不接受 `..` 或符号链接。报告保留服务器图片路径，仅在本机保存；不为生成预览自动下载服务器原图。
 
 ~~~bash
 python3 scripts/find_duplicates.py --mode copynce --backend cloud \
-  --profile "/path/to/private-config/profile.json" --remote-directory "." \
+  --profile "/path/to/private-config/profile.json" --quality enhanced --remote-directory "." \
   --summary-only --output-dir "/path/to/private-reports/remote-001"
 ~~~
 
@@ -99,7 +134,7 @@ python3 scripts/find_duplicates.py "/path/to/selected-gallery" --mode copynce --
   --profile "/path/to/private-config/profile.json" --plan-upload
 
 python3 scripts/find_duplicates.py "/path/to/selected-gallery" --mode copynce --backend cloud \
-  --profile "/path/to/private-config/profile.json" --allow-upload \
+  --profile "/path/to/private-config/profile.json" --quality enhanced --allow-upload \
   --summary-only --output-dir "/path/to/private-reports/upload-001"
 ~~~
 
@@ -126,11 +161,24 @@ python3 scripts/find_duplicates.py --mode copynce --backend cloud \
 
 | CLI 参数 | 用法 |
 | --- | --- |
-| `--threshold 0.75` | 最低原始余弦分数，范围 −1 至 1；默认 0.75，需用代表性正负图对校准 |
+| `--threshold 0.75` | 仅 fast 的最低原始余弦分数，范围 −1 至 1；默认 0.75，需领域校准 |
+| `--matcher-threshold 0.5` | 仅增强/深查的分类分数门槛；未校准起点，不是真实重复概率 |
+| `--candidate-k 32` | 每张图、每个整图/局部通道的基础候选数量，与报告条数分开 |
+| `--matcher-budget 10000` | 本次最多新增核验的无序图对数；缓存不占预算，计划未完成返回1 |
+| `--local-view-pairs 2` | 增强档每个方向额外复核的局部证据视图数 |
+| `--sn-extra-budget 1000` | 基础候选之外，以SN排序并限制每图份额的额外候选预算 |
 | `--whole-only` | 只比较整图；默认比较整图及固定局部裁块 |
-| `--search-mode auto` | 自动选择；`exact` 枚举所有选中图对，`indexed` 近似检索候选，可能遗漏 |
+| `--search-mode auto` | 自动选择；fast 的 `exact` 枚举所有选中图对，`indexed` 近似检索；增强/深查目前仅支持 exact 或 auto，auto 使用精确分块召回 |
 | `--top-k 100` | 最多返回的图对数；达到阈值的候选更多时报告标明截断 |
 | `--no-recursive` | 只扫描选定目录的直接子文件 |
 | `--summary-only` | 终端只显示统计，完整私有报告仍含路径；云端终端默认不列图像路径 |
 
-模型报告为 `schema_version=3`，读取 `matches`；每对包含原始余弦和两侧命中窗口，窗口坐标对应 EXIF 校正后的像素。`complete` 表示文件处理是否完整，`exhaustive` 表示是否枚举所有选中图对，`truncated` 表示返回数量是否达到上限；完整检索仍只覆盖生成的整图和固定裁块。与用户本机原图对应的预览最多展示 12 对，完整结果以报告为准。模型余弦与普通 similar 的 0–100 分独立。详见 [报告格式](report-format.md) 和 [宿主工具接入](client-compatibility.md)。
+fast 模型报告为 `schema_version=3`，读取 `matches`；每对包含原始余弦和两侧命中窗口，窗口坐标对应 EXIF 校正后的像素。`complete` 表示文件处理是否完整，`exhaustive` 表示是否枚举所有选中图对，`truncated` 表示返回数量是否达到上限；完整检索仍只覆盖生成的整图和固定裁块。与用户本机原图对应的预览最多展示 12 对，完整结果以报告为准。模型余弦与普通 similar 的 0–100 分独立。详见 [报告格式](report-format.md) 和 [宿主工具接入](client-compatibility.md)。
+
+## 预算不足后继续
+
+本机和服务器已有图库使用同一私有SQLite缓存逐对保存成功的正、负Matcher分数。预算耗尽后，用相同图库、质量和视图参数重跑，并选择新报告目录；已核验图对从缓存读取，预算只计算本次新增核验。可以增加预算，也可以分多次继续。更改原图内容、模型、流程或复核视图策略会使对应条目失效；背景改变时重新计算SN及候选调度，不复用旧偏置。
+
+schema4的 `stage_totals.matcher_cache_hits`、`matcher_new_verified`、`matcher_attempted_new` 分别说明缓存成功核验数、本次成功数和实际新增尝试数；`matcher_attempted` 包含缓存，因此可能大于本次计算预算。全部复用时Matcher设备标 `cache`，原计算设备另列，不伪称本次进行了GPU推理。
+
+授权上传仍按任务隔离并清理图片和全部查询缓存；预算不足也会正常清理。重新上传会创建新任务，不能跨上传任务恢复Matcher进度。仅描述子/Matcher缓存延续不等于允许长期保留远端上传图片。

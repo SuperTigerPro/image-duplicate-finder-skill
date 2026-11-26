@@ -134,8 +134,16 @@ python3 scripts/tool_adapter.py \
 
 示例的 report 已简化；完整字段见 [报告格式](report-format.md)。退出码 1 仍可有部分 report，`ok=false`；2 时 `report=null`，不能复用旧报告冒充新结果；130 表示中断。未知字段、错误类型、超过 1 MiB 的 JSON 和越界路径会被拒绝。
 
-copynce 返回 `schema_version=3` 的 `matches`、`complete`、`exhaustive` 和 `truncated`。适配器为模型 CLI 启用 `--summary-only`，但仍会读取完整私有报告并放进返回对象：**这不是自动脱敏返回。** 宿主必须在把结果交给云端聊天模型前按用户隐私偏好筛选，只回传必要统计或获准清单；完整路径和图片不应自动外发。报告不写连接 profile 中的地址或认证字段，图片完整路径仍可能包含账号名等隐私。含路径的报告、日志、配置、图片和特征均严禁发布到 GitHub。
+copynce快速模式返回schema3，增强/深查返回schema4，均读取 `matches`。schema4另核对 `files_complete`、`budget_complete`、`stage_totals`，不能把预算未处理候选当成不重复。适配器为模型 CLI 启用 `--summary-only`，但仍会读取完整私有报告并放进返回对象：**这不是自动脱敏返回。** 宿主必须在把结果交给云端聊天模型前按用户隐私偏好筛选，只回传必要统计或获准清单；完整路径和图片不应自动外发。报告不写连接 profile 中的地址或认证字段，图片完整路径仍可能包含账号名等隐私。含路径的报告、日志、配置、图片和特征均严禁发布到 GitHub。
 
 ## 没有本机工具时
 
 可以采用 [通用提示词](universal-agent-prompt.md)，由助手提供本机命令，用户在自己电脑执行后反馈统计或脱敏报告。将说明上传到知识库不会授予本机目录权限；只有云端执行环境时，也不能假装已读取用户电脑。
+
+## 增强模型工具参数
+
+旧请求省略 `model_quality` 时保持fast。Skill推荐的模型请求显式设 `model_quality="enhanced"`；deep使用官方代码的双向LCE。`matcher_threshold`、`candidate_k`、`matcher_budget`、`local_view_pairs` 和 `sn_extra_budget` 与返回 `top_k` 独立，增强请求不得携带旧 `model_threshold`。
+
+本机背景由宿主用 `--sn-index BACKGROUND_ID=/path/to/private-background/index` 绑定；模型只提供匿名 `sn_background="BACKGROUND_ID"`，不能指定背景文件路径或扩大已授权范围。模型使用仍须宿主 `--allow-model`；准备背景须由用户/宿主明确选择独立图片，工具请求不自动创建背景库。
+
+云端背景通过服务器私有配置绑定，工具不接收本机背景ID/路径，也不自动传输背景数据。客户端要求API2、两份校验通过的权重、官方SN与兼容背景指纹，传图前失败即停止。旧服务仍可接fast，但不能伪称完成增强。完整分数、预算及隐私规则见 [CopyNCE指南](copynce.md)。

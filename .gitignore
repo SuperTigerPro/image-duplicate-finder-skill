@@ -43,3 +43,9 @@ server.json
 config.*.json
 known_hosts*
 *.pub
+
+# Private SN resources and intermediate tensors.
+*.npz
+*.npy
+backgrounds/
+sn-index*/

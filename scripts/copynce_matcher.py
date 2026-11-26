@@ -1,0 +1,329 @@
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from https://github.com/eddielyc/CopyNCE; see third_party/CopyNCE-LICENSE.
+# The portable runtime, strict checkpoint checks and view metadata are modifications.
+"""Portable FP32 inference for the official ViT-S/16 CopyNCE Matcher.
+
+Inputs are decoded RGB images, already oriented by the caller. The official
+224-pixel bicubic/ImageNet preprocessing is applied without modifying inputs.
+Scores are the classification head's sigmoid output, not calibrated duplicate
+probabilities. The official-code LCE helper uses 35 star comparisons, whereas
+the paper describes a different, 260-comparison Cartesian ensemble.
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+import hashlib
+import os
+from pathlib import Path
+import stat
+
+import numpy as np
+from PIL import Image
+import torch
+from torch import nn
+
+if __package__:
+    from .copynce_model import Descriptor, _Block, _PatchEmbedding, _full_precision
+else:
+    from copynce_model import Descriptor, _Block, _PatchEmbedding, _full_precision
+
+OFFICIAL_SHA256 = "dd8dea1c345039bbda303c42457aa3a0389d46fb37ea39506bfb1faddedda1df"
+OFFICIAL_BYTES = 86_733_215
+OFFICIAL_FILE_ID = "1g6bAUTfyEXR20bUbEtHH_i5NBfrbDYHq"
+OFFICIAL_DOWNLOAD_URL = "https://drive.usercontent.google.com/download"
+OFFICIAL_SOURCE_URL = "https://github.com/eddielyc/CopyNCE"
+CHECKPOINT = "matcher_vits_224.pth.tar"
+MODEL_ID = "copynce-matcher-vits16-224"
+PREPROCESS_ID = "copynce-matcher-rgb224-bicubic-imagenet-v1-f32"
+OFFICIAL_LCE_PROFILE = "official-code-lce-star35-v1"
+
+# The verified public checkpoint has model + epoch. Its model contains exactly
+# 157 architecture tensors and NO training-only tensors to discard. Keep this
+# explicit empty whitelist; unexpected model keys must fail strict loading.
+TRAINING_ONLY_STATE_KEYS = frozenset()
+TRAINING_METADATA_KEYS = frozenset({"epoch"})
+
+
+class _MatcherEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.patch_embed = _PatchEmbedding()
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, 384))
+        self.pos_embed = nn.Parameter(torch.zeros(1, 197, 384))
+        self.blocks = nn.Sequential(*(_Block() for _ in range(8)))
+
+    def forward(self, images):
+        patches = self.patch_embed(images)
+        prefix = self.cls_token.expand(images.shape[0], -1, -1)
+        return self.blocks(torch.cat((prefix, patches), dim=1) + self.pos_embed)
+
+
+class _MatcherFusion(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, 384))
+        self.blocks = nn.Sequential(*(_Block() for _ in range(4)))
+        self.norm = nn.LayerNorm(384, eps=1e-4)
+
+    def forward(self, query_tokens, reference_tokens):
+        prefix = self.cls_token.expand(query_tokens.shape[0], -1, -1)
+        tokens = torch.cat((prefix, query_tokens, reference_tokens), dim=1)
+        return self.norm(self.blocks(tokens))[:, 0]
+
+
+class _MatcherClassificationHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # This second normalization is present in the official depth=0 head.
+        self.norm = nn.LayerNorm(384, eps=1e-4)
+        self.classifier = nn.Linear(384, 1)
+
+    def forward(self, fused_cls):
+        return torch.sigmoid(self.classifier(self.norm(fused_cls))).squeeze(-1)
+
+
+class _MatcherAuxiliaryHead(nn.Module):
+    """Retain the published auxiliary head tensors for fully strict loading."""
+    def __init__(self):
+        super().__init__()
+        self.norm = nn.LayerNorm(384, eps=1e-4)
+
+
+class _CopyMatcher(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = _MatcherEncoder()
+        self.fusion = _MatcherFusion()
+        self.heads = nn.ModuleDict({"cls_head": _MatcherClassificationHead(),
+                                    "fusion_head": _MatcherAuxiliaryHead()})
+
+    def forward(self, queries, references):
+        fused_cls = self.fusion(self.encoder(queries), self.encoder(references))
+        return self.heads["cls_head"](fused_cls)
+
+
+def _checkpoint_state(weights):
+    path = Path(weights).expanduser()
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(path, flags), "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size != OFFICIAL_BYTES:
+            raise ValueError("CopyNCE Matcher checkpoint size mismatch.")
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if digest.hexdigest() != OFFICIAL_SHA256:
+            raise ValueError("CopyNCE Matcher checkpoint SHA-256 mismatch.")
+        stream.seek(0)
+        record = torch.load(stream, map_location="cpu", weights_only=True)
+        after = os.fstat(stream.fileno())
+        stamp = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if stamp(before) != stamp(after):
+            raise ValueError("CopyNCE Matcher checkpoint changed while loading.")
+    if not isinstance(record, Mapping) or not isinstance(record.get("model"), Mapping):
+        raise ValueError("Expected the published CopyNCE Matcher checkpoint dictionary.")
+    if set(record) - {"model"} - TRAINING_METADATA_KEYS:
+        raise ValueError("Unexpected metadata in the CopyNCE Matcher checkpoint.")
+    cleaned = {}
+    for key, value in record["model"].items():
+        if not isinstance(key, str) or not isinstance(value, torch.Tensor):
+            raise ValueError("Expected Matcher model tensors with string keys.")
+        key = key.removeprefix("module.")
+        if key in TRAINING_ONLY_STATE_KEYS:
+            continue
+        if key in cleaned:
+            raise ValueError("Duplicate Matcher state key after prefix normalization.")
+        cleaned[key] = value
+    return cleaned, digest.hexdigest()
+
+
+def _rgb_array(image):
+    if isinstance(image, Image.Image):
+        if image.mode != "RGB" or min(image.size) < 1:
+            raise ValueError("Matcher inputs must be decoded RGB images.")
+        if image.size == (224, 224):
+            return np.asarray(image)
+        with image.resize((224, 224), Image.Resampling.BICUBIC) as resized:
+            return np.asarray(resized).copy()
+    array = np.asarray(image)
+    if array.dtype != np.uint8 or array.ndim != 3 or array.shape[2] != 3 or min(array.shape[:2]) < 1:
+        raise ValueError("Matcher inputs must be RGB uint8 images.")
+    if array.shape[:2] == (224, 224):
+        return array
+    with Image.fromarray(array) as source, source.resize((224, 224), Image.Resampling.BICUBIC) as resized:
+        return np.asarray(resized).copy()
+
+
+@dataclass(frozen=True)
+class MatcherView:
+    image: Image.Image
+    box: tuple[int, int, int, int]
+    rotation: int = 0
+
+
+def official_lce_views(image, role="query", *, resize_to_224=False):
+    """Return owned full-resolution views; caller must close every view.image.
+
+    This reproduces core.data.datasets.copy_dataset, including duplicate
+    center crops and query-only rotations. Box coordinates precede rotation.
+    Set resize_to_224 to resize and release each native view immediately rather
+    than retaining many full-resolution rotations for a large source image.
+    """
+    if role not in {"query", "reference"}:
+        raise ValueError("LCE role must be query or reference.")
+    if type(resize_to_224) is not bool:
+        raise ValueError("resize_to_224 must be a boolean.")
+    if not isinstance(image, Image.Image) or image.mode != "RGB" or min(image.size) < 3:
+        raise ValueError("Official LCE requires an RGB image at least 3 by 3 pixels.")
+    w, h = image.size
+    boxes = [(0, 0, w, h),
+             (w // 3, h // 3, 2 * w // 3, 2 * h // 3),
+             (w // 6, h // 6, w // 2, h // 2),
+             (w // 2, h // 6, 5 * w // 6, h // 2),
+             (w // 6, h // 2, w // 2, 5 * h // 6),
+             (w // 2, h // 2, 5 * w // 6, 5 * h // 6),
+             (0, 0, w // 2, h // 2), (w // 2, 0, w, h // 2),
+             (0, h // 2, w // 2, h), (w // 2, h // 2, w, h)]
+    if role == "query":
+        boxes.extend((col * w // 3, row * h // 3, (col + 1) * w // 3, (row + 1) * h // 3)
+                     for row in range(3) for col in range(3))
+    views = []
+
+    def append_view(native, box, rotation=0):
+        try:
+            if resize_to_224:
+                resized = native.resize((224, 224), Image.Resampling.BICUBIC)
+                native.close()
+                native = resized
+            views.append(MatcherView(native, box, rotation))
+        except BaseException:
+            native.close()
+            raise
+
+    try:
+        for box in boxes:
+            append_view(image.crop(box), box)
+        if role == "query":
+            for degrees in range(45, 360, 45):
+                rotated = image.rotate(degrees, expand=True, resample=Image.Resampling.BICUBIC)
+                append_view(rotated, (0, 0, w, h), degrees)
+        return views
+    except BaseException:
+        for view in views:
+            view.image.close()
+        raise
+
+
+def official_lce_pair_indices(query_count=26, reference_count=10):
+    if any(type(n) is not int or n < 1 for n in (query_count, reference_count)):
+        raise ValueError("LCE view counts must be positive integers.")
+    return tuple((i, 0) for i in range(query_count)) + tuple((0, j) for j in range(1, reference_count))
+
+
+class Matcher:
+    precision = "float32"
+    model_id = MODEL_ID
+    preprocess_id = PREPROCESS_ID
+
+    def __init__(self, weights, device="auto"):
+        self.requested_device = device
+        if device == "auto":
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        target = torch.device(device)
+        if target.type not in {"cpu", "cuda", "mps"}:
+            raise ValueError("Choose auto, cpu, mps or a CUDA device.")
+        state, self.weights_id = _checkpoint_state(weights)
+        self._net = _CopyMatcher().to(dtype=torch.float32).eval()
+        self._net.load_state_dict(state, strict=True)
+        self._mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+        self._std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+        self.device = "cpu"
+        self.fallbacks = []
+        self.max_batch = 8
+        if target.type != "cpu":
+            try:
+                self._move(target)
+                dummy = np.zeros((224, 224, 3), dtype=np.uint8)
+                with torch.inference_mode():
+                    score = self._forward([dummy], [dummy])
+                if score.shape != (1,) or not np.isfinite(score).all() or not (0 <= score[0] <= 1):
+                    raise RuntimeError("Invalid Matcher output from the device probe.")
+            except (RuntimeError, AssertionError, NotImplementedError) as exc:
+                exc.__traceback__ = None
+                self._move("cpu")
+                self.fallbacks.append(f"{target} probe failed; using CPU")
+                self._release_accelerator(str(target))
+
+    def _move(self, device):
+        self._net.to(device)
+        self._mean = self._mean.to(device)
+        self._std = self._std.to(device)
+        self.device = str(device)
+
+    _release_accelerator = staticmethod(Descriptor._release_accelerator)
+
+    def _batch(self, images):
+        batch = torch.from_numpy(np.stack([_rgb_array(image) for image in images]))
+        batch = batch.permute(0, 3, 1, 2).to(device=self.device, dtype=torch.float32)
+        return batch.div_(255.0).sub_(self._mean).div_(self._std)
+
+    def _forward(self, queries, references):
+        query_batch, reference_batch = self._batch(queries), self._batch(references)
+        with _full_precision(self.device):
+            return self._net(query_batch, reference_batch).to(device="cpu", dtype=torch.float32).numpy()
+
+    @torch.inference_mode()
+    def score_pairs(self, query_images, reference_images):
+        if len(query_images) != len(reference_images):
+            raise ValueError("Matcher query and reference batches must have equal lengths.")
+        if not len(query_images):
+            return np.empty((0,), dtype=np.float32)
+        offset, chunks = 0, []
+        while offset < len(query_images):
+            width = min(self.max_batch or len(query_images), len(query_images) - offset)
+            try:
+                scores = self._forward(query_images[offset:offset + width], reference_images[offset:offset + width])
+            except (RuntimeError, NotImplementedError) as exc:
+                if self.device == "cpu":
+                    raise
+                previous = self.device
+                message = str(exc).lower()
+                exc.__traceback__ = None
+                if width > 1 and ("out of memory" in message or "outofmemory" in message):
+                    self.max_batch = max(1, width // 2)
+                    self.fallbacks.append(f"{self.device} out of memory; batch size {self.max_batch}")
+                else:
+                    self._move("cpu")
+                    self.fallbacks.append(f"{previous} inference failed; using CPU")
+                self._release_accelerator(previous)
+                continue
+            if scores.shape != (width,) or scores.dtype != np.float32 or not np.isfinite(scores).all() or np.any((scores < 0) | (scores > 1)):
+                raise ValueError("Matcher returned invalid classification scores.")
+            chunks.append(scores)
+            offset += width
+        return np.concatenate(chunks)
+
+    def score_pairs_lce(self, query_images, reference_images):
+        """Apply the directed official-code Q26/R10 star ensemble to each pair."""
+        if len(query_images) != len(reference_images):
+            raise ValueError("Matcher query and reference batches must have equal lengths.")
+        output = []
+        for query, reference in zip(query_images, reference_images):
+            q_views, r_views = [], []
+            try:
+                q_views = official_lce_views(query, "query", resize_to_224=True)
+                r_views = official_lce_views(reference, "reference", resize_to_224=True)
+                pairs = official_lce_pair_indices(len(q_views), len(r_views))
+                scores = self.score_pairs([q_views[i].image for i, _ in pairs],
+                                          [r_views[j].image for _, j in pairs])
+                output.append(float(scores.max()))
+            finally:
+                for view in (*q_views, *r_views):
+                    view.image.close()
+        return np.asarray(output, dtype=np.float32)
