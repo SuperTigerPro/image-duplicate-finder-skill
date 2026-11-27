@@ -1,16 +1,23 @@
 """File selection, cached CopyNCE whole-image/region descriptors and cosine retrieval."""
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import CancelledError, ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 import heapq
+import hashlib
+import json
 import math
 import os
 import sqlite3
+import stat
+import threading
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageFile as PillowImageFile, ImageOps, __version__ as PILLOW_VERSION
 
 if __package__:
     from . import find_duplicates as core
@@ -23,6 +30,8 @@ AUTO_INDEX_VIEWS = 5000
 MAX_IMAGES = 10000
 MAX_VIEWS = 100000
 MAX_RETURNED_PAIRS = 20000
+PIXEL_DIGEST_POLICY = "copynce-oriented-rgb-full-v1-static-8bit-safety-v1"
+DECODE_PREFETCH = 2
 
 
 def _boxes(size, tiles):
@@ -83,35 +92,94 @@ def _collect(paths, recursive, include_hidden, extensions, file_stamps):
     return scanner
 
 
-def _decode(record, tiles, max_pixels):
+def _validate_decode_header(image, prefix, max_pixels):
+    if image.width * image.height > max_pixels:
+        raise ValueError("Image exceeds the configured pixel limit.")
+    if getattr(image, "n_frames", 1) != 1:
+        raise ValueError("CopyNCE supports only single-frame static images.")
+    bits = getattr(image, "tag_v2", {}).get(258, ())
+    if isinstance(bits, int):
+        bits = (bits,)
+    deep_png = prefix.startswith(b"\x89PNG\r\n\x1a\n") and prefix[24:25] == b"\x10"
+    if image.mode not in core.NORMALIZE_MODES or deep_png or (bits and max(bits) > 8):
+        raise ValueError("High bit-depth or special color format; use exact or pixels.")
+    if image.format == "ICO" and len(image.ico.sizes()) != 1:
+        raise ValueError("Multi-resolution ICO is unsupported by CopyNCE.")
+
+
+def _decode_header_size(record, max_pixels):
+    with core.checked_stream(record) as stream, warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        prefix = stream.read(26)
+        stream.seek(0)
+        with Image.open(stream) as image:
+            _validate_decode_header(image, prefix, max_pixels)
+            return image.size
+
+
+class _DecodeBudget:
+    """Limit concurrent native image pixels, not compressed input bytes."""
+    def __init__(self, limit):
+        self.limit, self.used, self.stopped = limit, 0, False
+        self.condition = threading.Condition()
+
+    @contextmanager
+    def claim(self, pixels):
+        if type(pixels) is not int or not 0 < pixels <= self.limit:
+            raise ValueError("Decoded image pixels exceed the native preparation budget")
+        with self.condition:
+            while self.used + pixels > self.limit and not self.stopped:
+                self.condition.wait()
+            if self.stopped:
+                raise CancelledError()
+            self.used += pixels
+        try:
+            yield
+        finally:
+            with self.condition:
+                self.used -= pixels
+                self.condition.notify_all()
+
+    def stop(self):
+        with self.condition:
+            self.stopped = True
+            self.condition.notify_all()
+
+
+def _decode(record, tiles, max_pixels, *, view_indices=None, pixel_info=None):
+    if pixel_info is not None and not isinstance(pixel_info, dict):
+        raise ValueError("pixel_info must be a metadata dictionary")
     views = []
+    metadata = None
     try:
         with core.checked_stream(record) as stream, warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             prefix = stream.read(26)
             stream.seek(0)
             with Image.open(stream) as image:
-                if image.width * image.height > max_pixels:
-                    raise ValueError("Image exceeds the configured pixel limit.")
-                if getattr(image, "n_frames", 1) != 1:
-                    raise ValueError("CopyNCE supports only single-frame static images.")
-                bits = getattr(image, "tag_v2", {}).get(258, ())
-                if isinstance(bits, int):
-                    bits = (bits,)
-                deep_png = prefix.startswith(b"\x89PNG\r\n\x1a\n") and prefix[24:25] == b"\x10"
-                if image.mode not in core.NORMALIZE_MODES or deep_png or (bits and max(bits) > 8):
-                    raise ValueError("High bit-depth or special color format; use exact or pixels.")
-                if image.format == "ICO" and len(image.ico.sizes()) != 1:
-                    raise ValueError("Multi-resolution ICO is unsupported by CopyNCE.")
+                _validate_decode_header(image, prefix, max_pixels)
                 with ImageOps.exif_transpose(image) as oriented, oriented.convert("RGB") as rgb:
                     size = rgb.size
                     boxes = _boxes(size, tiles)
-                    for box in boxes:
+                    indices = range(len(boxes)) if view_indices is None else tuple(view_indices)
+                    if any(type(index) is not int or not 0 <= index < len(boxes) for index in indices):
+                        raise ValueError("Invalid requested CopyNCE view index.")
+                    if pixel_info is not None:
+                        if __package__:
+                            from .copynce_sn import _rgb_pixel_sha256
+                        else:
+                            from copynce_sn import _rgb_pixel_sha256
+                        metadata = dict(raw_size=image.size, oriented_size=size,
+                                        pixel_sha256=_rgb_pixel_sha256(rgb))
+                    for index in indices:
+                        box = boxes[index]
                         if box == boxes[0]:
                             views.append(rgb.resize((224, 224), Image.Resampling.BICUBIC))
                         else:
                             with rgb.crop(box) as crop:
                                 views.append(crop.resize((224, 224), Image.Resampling.BICUBIC))
+        if pixel_info is not None:
+            pixel_info.update(metadata)
         return size, boxes, views
     except BaseException:
         for view in views:
@@ -145,15 +213,103 @@ def _load_cached(conn, path, pipeline, signature, tiles, dimension):
     if row is None:
         return None
     width, height, data = row
-    if width < 1 or height < 1:
+    if type(width) is not int or type(height) is not int or width < 1 or height < 1:
         return None
     boxes = _boxes((width, height), tiles)
-    if len(data) != len(boxes) * dimension * 4:
+    if not isinstance(data, (bytes, bytearray, memoryview)) or len(data) != len(boxes) * dimension * 4:
         return None
-    features = np.frombuffer(data, dtype="<f4").reshape(len(boxes), dimension)
+    try:
+        features = np.frombuffer(data, dtype="<f4").reshape(len(boxes), dimension)
+    except (TypeError, ValueError, BufferError):
+        return None
     if not np.isfinite(features).all():
         return None
     return str(path), (width, height), boxes, features
+
+
+def _pixel_cache_ready(conn):
+    """The optional digest table only lives in an owned private SQLite cache."""
+    if conn is None:
+        return False
+    try:
+        database = next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
+        if database:
+            info = os.stat(database, follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or os.name != "nt" and
+                    (info.st_uid != os.getuid() or info.st_mode & 0o077)):
+                return False
+        conn.execute("CREATE TABLE IF NOT EXISTS canonical_pixel_digests_v1 ("
+                     "path TEXT NOT NULL, pipeline TEXT NOT NULL, stat_key TEXT NOT NULL, "
+                     "raw_sha256 TEXT NOT NULL, policy TEXT NOT NULL, "
+                     "raw_width INTEGER NOT NULL, raw_height INTEGER NOT NULL, "
+                     "width INTEGER NOT NULL, height INTEGER NOT NULL, "
+                     "pixel_sha256 TEXT NOT NULL, validation_sha256 TEXT NOT NULL, "
+                     "PRIMARY KEY(path,pipeline))")
+        return True
+    except (OSError, sqlite3.DatabaseError, StopIteration):
+        return False  # Optional optimization: retain full original validation.
+
+
+def _pixel_policy():
+    return (PIXEL_DIGEST_POLICY + ":pillow=" + PILLOW_VERSION +
+            ":bomb=" + repr(Image.MAX_IMAGE_PIXELS) +
+            ":truncated=" + repr(PillowImageFile.LOAD_TRUNCATED_IMAGES) +
+            ":modes=" + ",".join(sorted(core.NORMALIZE_MODES)))
+
+
+def _pixel_header(record, max_pixels, *, oriented=False):
+    """Recheck current format and safety without decoding cached RGB pixels.
+
+    PNG getexif can load the image, so only ask for orientation when creating
+    new validation evidence. A matching raw SHA binds that evidence thereafter.
+    """
+    with core.checked_stream(record) as stream, warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        prefix = stream.read(26)
+        stream.seek(0)
+        with Image.open(stream) as image:
+            bits = getattr(image, "tag_v2", {}).get(258, ())
+            bits = (bits,) if isinstance(bits, int) else bits
+            if (image.width * image.height > max_pixels or getattr(image, "n_frames", 1) != 1 or
+                    image.mode not in core.NORMALIZE_MODES or
+                    prefix.startswith(b"\x89PNG\r\n\x1a\n") and prefix[24:25] == b"\x10" or
+                    bits and max(bits) > 8 or image.format == "ICO" and len(image.ico.sizes()) != 1):
+                raise ValueError("SN pixel identities require supported static 8-bit images within safety limits")
+            raw = image.size
+            if not oriented:
+                return raw, None
+            orientation = image.getexif().get(274)
+            return raw, ((raw[1], raw[0]) if orientation in (5, 6, 7, 8) else raw)
+
+
+def _pixel_validation_digest(values):
+    return hashlib.sha256(json.dumps(list(values), ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _load_pixel_digest(conn, path, pipeline, signature, raw_sha256, policy, raw_size, size):
+    try:
+        row = conn.execute("SELECT path,pipeline,stat_key,raw_sha256,policy,raw_width,raw_height,width,height,"
+                           "pixel_sha256,validation_sha256 FROM canonical_pixel_digests_v1 "
+                           "WHERE path=? AND pipeline=?", (str(path), pipeline)).fetchone()
+        expected = (str(path), pipeline, signature, raw_sha256, policy, *raw_size, *size)
+        if (row is None or row[:9] != expected or any(type(v) is not int for v in row[5:9]) or
+                not isinstance(row[9], str) or len(row[9]) != 64 or
+                any(c not in "0123456789abcdef" for c in row[9]) or
+                row[10] != _pixel_validation_digest(row[:10])):
+            return None
+        return row[9]
+    except (sqlite3.DatabaseError, TypeError, ValueError):
+        return None
+
+
+def _store_pixel_digest(conn, path, pipeline, signature, raw_sha256, policy, raw_size, size, digest):
+    values = (str(path), pipeline, signature, raw_sha256, policy, *raw_size, *size, digest)
+    try:
+        conn.execute("INSERT OR REPLACE INTO canonical_pixel_digests_v1 VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                     (*values, _pixel_validation_digest(values)))
+        return True
+    except sqlite3.DatabaseError:
+        return False
 
 
 def _features(files, model, cache, pipeline, tiles, batch_size, max_pixels, report_error, content_hashes=None,
@@ -163,6 +319,13 @@ def _features(files, model, cache, pipeline, tiles, batch_size, max_pixels, repo
     pending = []
     cache_hits = set()
     view_total = 0
+    pixel_cache = pixel_hashes is not None and _pixel_cache_ready(cache)
+    pixel_policy = _pixel_policy() if pixel_hashes is not None else None
+    if pixel_hashes is not None:
+        if __package__:
+            from .copynce_sn import pixel_sha256
+        else:
+            from copynce_sn import pixel_sha256
 
     def flush():
         if not pending:
@@ -181,9 +344,10 @@ def _features(files, model, cache, pipeline, tiles, batch_size, max_pixels, repo
         finally:
             for image in pending_images:
                 image.close()
+            pending_images.clear()
         all_vectors = np.concatenate(batches)
         offset = 0
-        for record, size, boxes, signature in pending:
+        for record, size, boxes, signature, pixel_digest, raw_size, content_id in pending:
             vectors = all_vectors[offset:offset + len(boxes)]
             offset += len(boxes)
             items.append((str(record.path), size, boxes, vectors))
@@ -191,51 +355,175 @@ def _features(files, model, cache, pipeline, tiles, batch_size, max_pixels, repo
                 cache.execute("INSERT OR REPLACE INTO descriptors VALUES(?,?,?,?,?,?)",
                               (str(record.path), pipeline, signature, *size,
                                vectors.astype("<f4", copy=False).tobytes()))
+                if pixel_cache:
+                    _store_pixel_digest(cache, record.path, pipeline, signature, content_id,
+                                        pixel_policy, raw_size, size, pixel_digest)
         if cache is not None:
             cache.commit()
         pending.clear()
         pending_images.clear()
 
-    for record in files:
+    budget = _DecodeBudget(max_pixels)
+    image_errors = (OSError, ValueError, SyntaxError, Image.DecompressionBombWarning, Image.DecompressionBombError)
+
+    def inspect_record(record):
+        job = SimpleNamespace(record=record, content_id=None, stamp=None, item=None, pixel_digest=None,
+                              raw_size=None, pixel_backfill=False, publish_pixel=False, error=None, future=None,
+                              lazy_header=False)
         try:
             core.assert_unchanged(record, os.stat(record.path, follow_symlinks=False))
             with core.checked_stream(record) as stream:
-                content_id = core.exact_digest(stream)
-            if content_hashes is not None:
-                content_hashes[str(record.path)] = content_id
+                prefix = stream.read(26)
+                stream.seek(0)
+                job.content_id = core.exact_digest(stream)
+            # Other plugins can load pixels while probing frames/ICO headers.
+            # Serialize their header inspection against native worker decodes.
+            job.lazy_header = prefix.startswith(b"\x89PNG\r\n\x1a\n") or prefix.startswith(b"\xff\xd8")
+            job.stamp = ":".join(map(str, record.stamp)) + ":" + job.content_id
+            job.item = _load_cached(cache, record.path, pipeline, job.stamp, tiles, model.dimension)
             if pixel_hashes is not None:
-                if __package__:
-                    from .copynce_sn import pixel_sha256
-                else:
-                    from copynce_sn import pixel_sha256
-                pixel_hashes[str(record.path)] = pixel_sha256(record, max_pixels)
-            stamp = ":".join(map(str, record.stamp)) + ":" + content_id
-            item = _load_cached(cache, record.path, pipeline, stamp, tiles, model.dimension)
-            if item is not None:
-                if item[1][0] * item[1][1] > max_pixels:
+                if job.item is not None and any(type(v) is not int for v in job.item[1]):
+                    job.item = None
+                if job.item is not None:
+                    with nullcontext() if job.lazy_header else budget.claim(max_pixels):
+                        job.raw_size, _ = _pixel_header(record, max_pixels)
+                    if pixel_cache:
+                        job.pixel_digest = _load_pixel_digest(cache, record.path, pipeline, job.stamp, job.content_id,
+                                                              pixel_policy, job.raw_size, job.item[1])
+                    if job.pixel_digest is None:
+                        # Legacy proof backfill shares the native pixel budget
+                        # with any already-running miss preparations.
+                        with budget.claim(job.raw_size[0] * job.raw_size[1]):
+                            job.pixel_digest = pixel_sha256(record, max_pixels)
+                            _, oriented_size = _pixel_header(record, max_pixels, oriented=True)
+                        if oriented_size != job.item[1]:
+                            job.item = None
+                        elif pixel_cache:
+                            job.pixel_backfill = True
+                    job.publish_pixel = True
+            if job.item is not None:
+                if job.item[1][0] * job.item[1][1] > max_pixels:
                     raise ValueError("Image exceeds the configured pixel limit.")
-                if view_total + len(item[2]) > MAX_VIEWS:
-                    report_error(record.path, "ModelLimitError: reached the descriptor view limit; remaining files were not processed")
-                    break
-                view_total += len(item[2])
-                items.append(item)
-                cache_hits.add(str(record.path))
-                continue
-            size, boxes, views = _decode(record, tiles, max_pixels)
-        except (OSError, ValueError, SyntaxError, Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
-            report_error(record.path, str(exc))
-            continue
-        if view_total + len(views) > MAX_VIEWS:
-            for view in views:
-                view.close()
-            report_error(record.path, "ModelLimitError: reached the descriptor view limit; remaining files were not processed")
-            break
-        view_total += len(views)
-        pending.append((record, size, boxes, stamp))
-        pending_images.extend(views)
-        if len(pending_images) >= batch_size:
+            elif job.raw_size is None:
+                with nullcontext() if job.lazy_header else budget.claim(max_pixels):
+                    job.raw_size = _decode_header_size(record, max_pixels)
+        except image_errors as exc:
+            job.error = exc
+        return job
+
+    def prepare_views(job):
+        result = None
+        metadata = {} if pixel_hashes is not None and job.pixel_digest is None else None
+        try:
+            with budget.claim(job.raw_size[0] * job.raw_size[1]):
+                if metadata is None:
+                    result = _decode(job.record, tiles, max_pixels)
+                else:
+                    result = _decode(job.record, tiles, max_pixels, pixel_info=metadata)
+                core.assert_unchanged(job.record, os.stat(job.record.path, follow_symlinks=False))
+            return (*result, metadata)
+        except BaseException:
+            if result is not None:
+                for image in result[2]:
+                    image.close()
+            raise
+
+    jobs, owned = deque(), set()
+    source = iter(files)
+    pool = None
+    exhausted = False
+    slots = min(2, max(1, DECODE_PREFETCH))
+
+    def fill_jobs():
+        nonlocal pool, exhausted
+        while len(jobs) < slots and not exhausted:
+            try:
+                record = next(source)
+            except StopIteration:
+                exhausted = True
+                break
+            job = inspect_record(record)  # SQLite and source hashes stay on this thread.
+            if job.error is None and job.item is None:
+                if pool is None:
+                    pool = ThreadPoolExecutor(max_workers=slots, thread_name_prefix="copynce-decode")
+                job.future = pool.submit(prepare_views, job)
+                owned.add(job.future)
+            jobs.append(job)
+
+    def discard(future):
+        try:
+            result = future.result()
+        except Exception:
+            pass
+        else:
+            for image in result[2]:
+                image.close()
+        owned.discard(future)
+
+    # All workers inherit and restore the same strict Pillow warning policy.
+    # Join them before restoring process-global filters.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        try:
+            fill_jobs()
+            while jobs:
+                job = jobs.popleft()
+                record = job.record
+                try:
+                    core.assert_unchanged(record, os.stat(record.path, follow_symlinks=False))
+                    if content_hashes is not None and job.content_id is not None:
+                        content_hashes[str(record.path)] = job.content_id
+                    if job.publish_pixel:
+                        pixel_hashes[str(record.path)] = job.pixel_digest
+                    if job.error is not None:
+                        raise job.error
+                    if job.item is not None:
+                        item = job.item
+                        if job.pixel_backfill:
+                            _store_pixel_digest(cache, record.path, pipeline, job.stamp, job.content_id,
+                                                pixel_policy, job.raw_size, item[1], job.pixel_digest)
+                        if view_total + len(item[2]) > MAX_VIEWS:
+                            report_error(record.path, "ModelLimitError: reached the descriptor view limit; remaining files were not processed")
+                            break
+                        view_total += len(item[2])
+                        items.append(item)
+                        cache_hits.add(str(record.path))
+                    else:
+                        size, boxes, views, metadata = job.future.result()
+                        core.assert_unchanged(record, os.stat(record.path, follow_symlinks=False))
+                        if metadata is not None:
+                            job.pixel_digest, job.raw_size = metadata["pixel_sha256"], metadata["raw_size"]
+                            pixel_hashes[str(record.path)] = job.pixel_digest
+                        if view_total + len(views) > MAX_VIEWS:
+                            discard(job.future)
+                            report_error(record.path, "ModelLimitError: reached the descriptor view limit; remaining files were not processed")
+                            break
+                        view_total += len(views)
+                        pending.append((record, size, boxes, job.stamp, job.pixel_digest, job.raw_size, job.content_id))
+                        pending_images.extend(views)
+                        owned.discard(job.future)  # Ownership has moved to the model batch.
+                except image_errors as exc:
+                    if job.future in owned:
+                        discard(job.future)
+                    report_error(record.path, str(exc))
+                fill_jobs()
+                if len(pending_images) >= batch_size:
+                    flush()
             flush()
-    flush()
+        finally:
+            budget.stop()
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
+            for future in tuple(owned):
+                try:
+                    discard(future)
+                except BaseException:
+                    pass  # Preserve the active interruption/error, not a future beyond scope.
+            for image in pending_images:
+                image.close()
+            pending_images.clear()
+    if pixel_cache:
+        cache.commit()  # Backfill successful cache-hit rows together, not per pair.
     return sorted(items, key=lambda item: item[0]), cache_hits
 
 

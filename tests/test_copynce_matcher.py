@@ -266,5 +266,194 @@ class MatcherTests(unittest.TestCase):
             self.assertEqual(original.getpixel((0, 0)), (255, 0, 0))
 
 
+@unittest.skipUnless(matcher is not None, "optional PyTorch Matcher runtime is unavailable")
+class TokenCacheTests(unittest.TestCase):
+    """Tiny structural modules only: no official model/weights or accelerators."""
+    @classmethod
+    def setUpClass(cls):
+        cls.previous_threads = torch.get_num_threads()
+        torch.set_num_threads(2)
+
+    @classmethod
+    def tearDownClass(cls):
+        torch.set_num_threads(cls.previous_threads)
+
+    def model(self):
+        class Encoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("scale", torch.tensor(1.))
+                self.widths = []
+            def forward(self, value):
+                self.widths.append(len(value))
+                return (value.mean(dim=(2, 3)) * self.scale).unsqueeze(1).expand(-1, 2, -1)
+        class Fusion(torch.nn.Module):
+            def forward(self, left, right):
+                return torch.cat((left, right), dim=1).mean(dim=1)
+        class Head(torch.nn.Module):
+            def forward(self, value):
+                return torch.sigmoid(value.sum(dim=1))
+        class Net(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder, self.fusion = Encoder(), Fusion()
+                self.heads = torch.nn.ModuleDict({"cls_head": Head()})
+            def forward(self, left, right):
+                return self.heads["cls_head"](self.fusion(self.encoder(left), self.encoder(right)))
+        model = matcher.Matcher.__new__(matcher.Matcher)
+        model._net = Net().eval()
+        model._mean = torch.tensor([.485, .456, .406]).view(1, 3, 1, 1)
+        model._std = torch.tensor([.229, .224, .225]).view(1, 3, 1, 1)
+        model.device, model.weights_id, model.max_batch = "cpu", "fixture", 8
+        model.fallbacks, model._token_cache = [], None
+        model._release_accelerator = mock.Mock()
+        return model
+
+    def images(self):
+        return ([np.full((224, 224, 3), value, np.uint8) for value in (11, 53, 89)],
+                [np.full((224, 224, 3), value, np.uint8) for value in (127, 173, 251)])
+
+    def test_ab_ba_reuses_two_full_batches_and_preserves_bits_and_state(self):
+        model = self.model()
+        left, right = self.images()
+        state_keys = list(model._net.state_dict())
+        baseline = (model.score_pairs(left, right), model.score_pairs(right, left))
+        self.assertEqual(model._net.encoder.widths, [3, 3, 3, 3])
+        model._net.encoder.widths.clear()
+        model.enable_token_cache()
+        optimized = (model.score_pairs(left, right), model.score_pairs(right, left))
+        for a, b in zip(baseline, optimized):
+            np.testing.assert_array_equal(a, b)
+        self.assertEqual(model._net.encoder.widths, [3, 3])
+        self.assertEqual(model.token_cache_info["batch_hits"], 2)
+        self.assertEqual(model.token_cache_info["rows_reused"], 6)
+        self.assertEqual(list(model._net.state_dict()), state_keys)
+
+    def test_partial_miss_reencodes_original_width_and_mutable_rgb_is_hashed(self):
+        model = self.model()
+        model.enable_token_cache()
+        left, right = self.images()
+        model.score_pairs(left, right)
+        left[1][0, 0, 0] ^= 1  # Same Python object, different pixels.
+        result = model.score_pairs(left, right)
+        self.assertEqual(model._net.encoder.widths, [3, 3, 3])
+        model.disable_token_cache()
+        expected = model.score_pairs(left, right)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_slot_and_batch_context_changes_do_not_reuse_wrong_tokens(self):
+        model = self.model()
+        model.enable_token_cache()
+        left, right = self.images()
+        model.score_pairs(left, right)
+        model.score_pairs(list(reversed(left)), right)
+        self.assertEqual(model._net.encoder.widths, [3, 3, 3])
+        model.score_pairs(left[:2], right[:2])
+        self.assertEqual(model._net.encoder.widths[-2:], [2, 2])
+        self.assertEqual(model.token_cache_info["entries"], 4)
+        model.max_batch = 4
+        model.score_pairs(left[:2], right[:2])
+        self.assertEqual(model._net.encoder.widths[-2:], [2, 2])
+        self.assertGreaterEqual(model.token_cache_info["clears"], 3)
+
+    def test_byte_bound_uses_independent_row_storage(self):
+        model = self.model()
+        model.enable_token_cache(max_bytes=48)
+        model.score_pairs(*self.images())
+        self.assertLessEqual(model.token_cache_info["current_bytes"], 48)
+        self.assertGreater(model.token_cache_info["evictions"], 0)
+        for value in model._token_cache.values():
+            self.assertEqual(value.untyped_storage().nbytes(), value.numel() * value.element_size())
+
+    def test_cpu_storage_preserves_bits(self):
+        model = self.model()
+        left, right = self.images()
+        expected = model.score_pairs(right, left)
+        model.enable_token_cache(storage="cpu")
+        model.score_pairs(left, right)
+        np.testing.assert_array_equal(model.score_pairs(right, left), expected)
+        self.assertTrue(all(value.device.type == "cpu" for value in model._token_cache.values()))
+
+    def test_move_disable_and_weight_identity_invalidate(self):
+        model = self.model()
+        model.enable_token_cache()
+        left, right = self.images()
+        model.score_pairs(left, right)
+        model.weights_id = "another-fixture"
+        model.score_pairs(left, right)
+        self.assertEqual(model._net.encoder.widths, [3, 3, 3, 3])
+        model._move("cpu")
+        self.assertEqual(model.token_cache_info["entries"], 0)
+        self.assertTrue(model.token_cache_info["enabled"])
+        model.disable_token_cache()
+        self.assertFalse(model.token_cache_info["enabled"])
+        self.assertEqual(model.token_cache_info["max_bytes"], 128 * 1024 * 1024)
+        self.assertEqual(model.token_cache_info["storage"], "device")
+
+    def test_inference_error_clears_cache_before_cpu_error_escapes(self):
+        model = self.model()
+        model.enable_token_cache()
+        model.score_pairs(*self.images())
+        model._forward = mock.Mock(side_effect=RuntimeError("synthetic failure"))
+        with self.assertRaises(RuntimeError):
+            model.score_pairs(*self.images())
+        self.assertEqual(model.token_cache_info["entries"], 0)
+        self.assertEqual(model.token_cache_info["last_clear"], "inference_exception")
+
+    def test_training_mode_never_reuses_tokens(self):
+        model = self.model()
+        model.enable_token_cache()
+        model._net.train()
+        left, right = self.images()
+        model.score_pairs(left, right)
+        model.score_pairs(right, left)
+        self.assertEqual(model._net.encoder.widths, [3, 3, 3, 3])
+        self.assertEqual(model.token_cache_info["entries"], 0)
+
+    def test_cuda_auto_cache_is_disabled_when_moving_to_cpu(self):
+        model = self.model()
+        model.enable_token_cache()
+        model.score_pairs(*self.images())
+        model._token_cache_cuda_auto = True
+        model.device = "cuda"  # Fake device state; no accelerator operations.
+        model._move("cpu")
+        self.assertEqual(model.device, "cpu")
+        self.assertFalse(model.token_cache_info["enabled"])
+        self.assertFalse(model.token_cache_info["cuda_auto"])
+        self.assertEqual(model.token_cache_info["entries"], 0)
+
+    def test_explicit_enable_resets_auto_flag_and_retains_manual_cpu_policy(self):
+        model = self.model()
+        model.enable_token_cache()
+        model._token_cache_cuda_auto = True
+        model.enable_token_cache(storage="cpu")
+        self.assertFalse(model.token_cache_info["cuda_auto"])
+        model.score_pairs(*self.images())
+        model._move("cpu")
+        self.assertTrue(model.token_cache_info["enabled"])
+        self.assertEqual(model.token_cache_info["storage"], "cpu")
+        self.assertEqual(model.token_cache_info["entries"], 0)
+        model.disable_token_cache()
+        self.assertFalse(model.token_cache_info["cuda_auto"])
+
+    def test_cuda_inference_fallback_does_not_enable_cpu_auto_cache(self):
+        model = self.model()
+        model.enable_token_cache()
+        model.score_pairs(*self.images())
+        model._token_cache_cuda_auto = True
+        model.device = "cuda"
+        def forward(left, right):
+            if model.device == "cuda":
+                raise RuntimeError("synthetic accelerator failure")
+            self.assertFalse(model.token_cache_info["enabled"])
+            return np.full(len(left), .4, dtype=np.float32)
+        model._forward = forward
+        result = model.score_pairs(*self.images())
+        np.testing.assert_array_equal(result, np.full(3, .4, dtype=np.float32))
+        self.assertEqual(model.device, "cpu")
+        self.assertFalse(model.token_cache_info["cuda_auto"])
+        self.assertEqual(len(model.fallbacks), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

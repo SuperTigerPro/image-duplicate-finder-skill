@@ -26,6 +26,7 @@ scripts/copynce_matcher.py scripts/copynce_sn.py scripts/copynce_pipeline.py
 tests/test_check_public_files.py tests/test_copynce_cli.py tests/test_copynce_cloud.py
 tests/test_copynce_engine.py tests/test_copynce_server.py tests/test_copynce_setup.py tests/test_copynce_model.py
 tests/test_copynce_matcher.py tests/test_copynce_sn.py tests/test_copynce_pipeline.py tests/test_copynce_remote_jobs.py
+tests/test_copynce_preprocessing.py
 tests/test_find_duplicates.py tests/test_image_similarity.py tests/test_skill_package.py
 tests/test_tool_adapter.py third_party/CopyNCE-LICENSE
 """.split())

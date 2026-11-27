@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -60,6 +61,7 @@ class EnhancedPipelineTests(unittest.TestCase):
         self.index = self.root / "sn-index"
         sn.build_index([background], Path("fixture"), self.index)
         self.matcher = Matcher()
+        self.real_matcher_loader = pipeline._load_matcher
         patch = mock.patch.object(pipeline, "_matcher_weights_id", return_value=self.matcher.weights_id)
         patch.start()
         self.addCleanup(patch.stop)
@@ -137,6 +139,29 @@ class EnhancedPipelineTests(unittest.TestCase):
         self.assertEqual(raw["stage_totals"]["matcher_model_comparisons"], 4)
         self.assertEqual(row["box_source"], "matcher-tested-window")
         self.assertNotEqual((row["box_a"], row["box_b"]), ([0, 0, 24, 17], [0, 0, 24, 17]))
+
+    def test_new_pairs_reuse_the_evidence_already_computed_for_the_cache_key(self):
+        self.imageset(3)
+        with mock.patch.object(pipeline, "_evidence", wraps=pipeline._evidence) as evidence:
+            raw = self.scan()
+        self.assertEqual(raw["stage_totals"]["matcher_new_verified"], 3)
+        self.assertEqual(evidence.call_count, 3)
+
+    def test_automatic_token_reuse_is_limited_to_cuda_enhanced_unsplit_batches(self):
+        for device, profile, views, expected in (("cpu", "enhanced", 2, False),
+                                                  ("mps", "enhanced", 2, False),
+                                                  ("cuda", "deep", 2, False),
+                                                  ("cuda", "enhanced", 8, False),
+                                                  ("cuda", "enhanced", 2, True)):
+            with self.subTest(device=device, profile=profile, views=views):
+                model = SimpleNamespace(device=device, max_batch=8, enable_token_cache=mock.Mock())
+                module = SimpleNamespace(Matcher=mock.Mock(return_value=model))
+                with mock.patch.dict(sys.modules, {"copynce_matcher": module}):
+                    result = self.real_matcher_loader(Path("fixture"), "auto", profile=profile,
+                                                      local_view_pairs=views)
+                self.assertIs(result, model)
+                self.assertEqual(model.enable_token_cache.call_count, int(expected))
+                self.assertEqual(getattr(model, "_token_cache_cuda_auto", False), expected)
 
     def test_deep_uses_native_images_and_reports_two_star_passes(self):
         self.imageset(2)

@@ -39,9 +39,20 @@ def _digest_file(path):
         return engine.core.exact_digest(stream)
 
 
+def _rgb_pixel_sha256(rgb):
+    """Hash already validated oriented RGB pixels without modifying the image."""
+    if not isinstance(rgb, Image.Image) or rgb.mode != "RGB" or min(rgb.size) < 1:
+        raise ValueError("Pixel identity requires a nonempty RGB PIL image")
+    digest = hashlib.sha256(b"copynce-oriented-rgb-full-v1\0")
+    digest.update(struct.pack(">QQ", *rgb.size))
+    for top in range(0, rgb.height, 128):
+        with rgb.crop((0, top, rgb.width, min(top + 128, rgb.height))) as stripe:
+            digest.update(stripe.tobytes())
+    return digest.hexdigest()
+
+
 def pixel_sha256(record, max_pixels=40000000):
     """Full oriented RGB identity survives metadata removal and lossless cloud PNG transfer."""
-    digest = hashlib.sha256(b"copynce-oriented-rgb-full-v1\0")
     with engine.core.checked_stream(record) as stream, warnings.catch_warnings():
         warnings.simplefilter("error", Image.DecompressionBombWarning)
         prefix = stream.read(26)
@@ -55,11 +66,8 @@ def pixel_sha256(record, max_pixels=40000000):
                     bits and max(bits) > 8 or image.format == "ICO" and len(image.ico.sizes()) != 1):
                 raise ValueError("SN pixel identities require supported static 8-bit images within safety limits")
             with ImageOps.exif_transpose(image) as oriented, oriented.convert("RGB") as rgb:
-                digest.update(struct.pack(">QQ", *rgb.size))
-                for top in range(0, rgb.height, 128):
-                    with rgb.crop((0, top, rgb.width, min(top + 128, rgb.height))) as stripe:
-                        digest.update(stripe.tobytes())
-    return digest.hexdigest()
+                result = _rgb_pixel_sha256(rgb)
+    return result
 
 
 def _private_path(value, *, exists=True):

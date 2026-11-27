@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+from collections import OrderedDict
 from contextlib import contextmanager
 import warnings
 
@@ -29,14 +30,63 @@ MAX_LOCAL_VIEW_PAIRS = 8
 EXTRA_PER_QUERY_CAP = 8
 MATCHER_CACHE_POLICY = "matcher-result-v1-bidirectional-f32"
 MAX_MATCHER_CACHE_ROWS = 200000
+MAX_VIEW_CACHE_BYTES = 128 * 1024 * 1024
 
 
-def _load_matcher(weights, device):
+class _ImageViewCache:
+    """Run-local RGB windows; evict by bytes without keeping native images open."""
+
+    def __init__(self, max_bytes=MAX_VIEW_CACHE_BYTES):
+        self.max_bytes = max_bytes
+        self.bytes = 0
+        self.views = OrderedDict()
+
+    def get(self, item, record, indices, max_pixels):
+        engine.core.assert_unchanged(record, os.stat(record.path, follow_symlinks=False))
+        indices = tuple(dict.fromkeys(indices))
+        tiles = len(item[2]) > 1
+        prefix = (str(record.path), record.stamp, tiles, max_pixels)
+        result, missing = {}, []
+        for index in indices:
+            key = (*prefix, index)
+            array = self.views.get(key)
+            if array is None:
+                missing.append(index)
+            else:
+                self.views.move_to_end(key)
+                result[index] = array
+        if missing:
+            size, boxes, decoded = engine._decode(record, tiles, max_pixels, view_indices=missing)
+            try:
+                if size != item[1] or boxes != item[2] or len(decoded) != len(missing):
+                    raise ValueError("Decoded Matcher windows differ from the verified descriptors")
+                for index, image in zip(missing, decoded):
+                    array = np.asarray(image).copy()
+                    array.setflags(write=False)
+                    result[index] = array
+                    if array.nbytes <= self.max_bytes:
+                        while self.bytes + array.nbytes > self.max_bytes:
+                            _, old = self.views.popitem(last=False)
+                            self.bytes -= old.nbytes
+                        self.views[(*prefix, index)] = array
+                        self.bytes += array.nbytes
+            finally:
+                for image in decoded:
+                    image.close()
+        return result
+
+
+def _load_matcher(weights, device, *, profile="enhanced", local_view_pairs=2):
     if __package__:
         from .copynce_matcher import Matcher
     else:
         from copynce_matcher import Matcher
-    return Matcher(str(weights), device)
+    matcher = Matcher(str(weights), device)
+    if (profile == "enhanced" and str(matcher.device).startswith("cuda")
+            and 1 + local_view_pairs <= matcher.max_batch):
+        matcher.enable_token_cache()
+        matcher._token_cache_cuda_auto = True
+    return matcher
 
 
 def _matcher_weights_id(weights):
@@ -309,8 +359,12 @@ def _original_rgb(record, max_pixels):
             return oriented.convert("RGB")
 
 
-def _verify_pair(items, records, a, b, matcher, profile, local_view_pairs, bias, max_pixels):
-    row, local_views = _evidence(items, a, b, bias, local_view_pairs)
+def _verify_pair(items, records, a, b, matcher, profile, local_view_pairs, bias, max_pixels,
+                 view_cache=None, evidence=None):
+    if evidence is None:
+        row, local_views = _evidence(items, a, b, bias, local_view_pairs)
+    else:
+        row, local_views = dict(evidence[0]), evidence[1]
     if profile == "deep":
         with _original_rgb(records[row["path_a"]], max_pixels) as left, _original_rgb(records[row["path_b"]], max_pixels) as right:
             ab = float(np.asarray(matcher.score_pairs_lce([left], [right]))[0])
@@ -318,28 +372,22 @@ def _verify_pair(items, records, a, b, matcher, profile, local_view_pairs, bias,
         count = 70
         row.update(matcher_view_policy="official-star-35-bidirectional", box_source="descriptor-evidence")
     else:
-        _, _, left = engine._decode(records[row["path_a"]], len(items[a][2]) > 1, max_pixels)
-        try:
-            _, _, right = engine._decode(records[row["path_b"]], len(items[b][2]) > 1, max_pixels)
-            try:
-                views = [(0, 0), *local_views]
-                queries, references = [left[x] for x, _ in views], [right[y] for _, y in views]
-                scores_ab = np.asarray(matcher.score_pairs(queries, references), dtype=np.float32)
-                scores_ba = np.asarray(matcher.score_pairs(references, queries), dtype=np.float32)
-                if scores_ab.shape != (len(views),) or scores_ba.shape != (len(views),):
-                    raise ValueError("Matcher returned an invalid number of view scores")
-                ab, ba = float(scores_ab.max()), float(scores_ba.max())
-                best = int(np.maximum(scores_ab, scores_ba).argmax())
-                x, y = views[best]
-                row.update(box_a=list(items[a][2][x]), box_b=list(items[b][2][y]),
-                           matcher_view_policy="whole-plus-descriptor-evidence-bidirectional", box_source="matcher-tested-window")
-                count = 2 * len(views)
-            finally:
-                for image in right:
-                    image.close()
-        finally:
-            for image in left:
-                image.close()
+        views = [(0, 0), *local_views]
+        if view_cache is None:
+            view_cache = _ImageViewCache(0)
+        left = view_cache.get(items[a], records[row["path_a"]], (x for x, _ in views), max_pixels)
+        right = view_cache.get(items[b], records[row["path_b"]], (y for _, y in views), max_pixels)
+        queries, references = [left[x] for x, _ in views], [right[y] for _, y in views]
+        scores_ab = np.asarray(matcher.score_pairs(queries, references), dtype=np.float32)
+        scores_ba = np.asarray(matcher.score_pairs(references, queries), dtype=np.float32)
+        if scores_ab.shape != (len(views),) or scores_ba.shape != (len(views),):
+            raise ValueError("Matcher returned an invalid number of view scores")
+        ab, ba = float(scores_ab.max()), float(scores_ba.max())
+        best = int(np.maximum(scores_ab, scores_ba).argmax())
+        x, y = views[best]
+        row.update(box_a=list(items[a][2][x]), box_b=list(items[b][2][y]),
+                   matcher_view_policy="whole-plus-descriptor-evidence-bidirectional", box_source="matcher-tested-window")
+        count = 2 * len(views)
     if not all(math.isfinite(s) and 0 <= s <= 1 for s in (ab, ba)):
         raise ValueError("Matcher returned a non-finite or invalid probability score")
     row.update(score=max(ab, ba), matcher_score=max(ab, ba), matcher_a_to_b=ab, matcher_b_to_a=ba,
@@ -400,6 +448,7 @@ def run(items, records, content_hashes, scanner, descriptor, *, profile, matcher
     comparisons = 0
     verified = {}
     heap = []
+    view_cache = _ImageViewCache()
     with _matcher_cache(cache) as connection:
         for edge, reason in plan.items():
             a, b = edge
@@ -429,10 +478,12 @@ def run(items, records, content_hashes, scanner, descriptor, *, profile, matcher
                     visited.add(edge)
                     attempted_new += 1
                     if matcher is None:
-                        matcher = _load_matcher(matcher_weights, device)
+                        matcher = _load_matcher(matcher_weights, device, profile=profile,
+                                                local_view_pairs=local_view_pairs)
                         if matcher.weights_id != matcher_hash:
                             raise ValueError("Matcher identity differs from the verified cache policy")
-                    row, calls = _verify_pair(items, records, a, b, matcher, profile, local_view_pairs, bias, max_pixels)
+                    row, calls = _verify_pair(items, records, a, b, matcher, profile, local_view_pairs, bias, max_pixels,
+                                              view_cache=view_cache, evidence=(row, views))
                     comparisons += calls
                     row["matcher_cache_hit"] = False
                     cache_writes += 1

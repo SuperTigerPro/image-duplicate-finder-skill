@@ -12,6 +12,7 @@ the paper describes a different, 260-comparison Cartesian ensemble.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
 import os
@@ -37,6 +38,7 @@ CHECKPOINT = "matcher_vits_224.pth.tar"
 MODEL_ID = "copynce-matcher-vits16-224"
 PREPROCESS_ID = "copynce-matcher-rgb224-bicubic-imagenet-v1-f32"
 OFFICIAL_LCE_PROFILE = "official-code-lce-star35-v1"
+TOKEN_CACHE_POLICY = "copynce-matcher-token-width-slot-f32-v1"
 
 # The verified public checkpoint has model + epoch. Its model contains exactly
 # 157 architecture tensors and NO training-only tensors to discard. Keep this
@@ -246,6 +248,8 @@ class Matcher:
         self.device = "cpu"
         self.fallbacks = []
         self.max_batch = 8
+        self._token_cache = None  # Opt-in, run-local; checkpoint/model state is unchanged.
+        self._token_cache_cuda_auto = False
         if target.type != "cpu":
             try:
                 self._move(target)
@@ -261,12 +265,109 @@ class Matcher:
                 self._release_accelerator(str(target))
 
     def _move(self, device):
+        if getattr(self, "_token_cache_cuda_auto", False) and torch.device(device).type != "cuda":
+            self.disable_token_cache()
+        else:
+            self.clear_token_cache("device_move")
         self._net.to(device)
         self._mean = self._mean.to(device)
         self._std = self._std.to(device)
         self.device = str(device)
 
     _release_accelerator = staticmethod(Descriptor._release_accelerator)
+
+    def enable_token_cache(self, max_bytes=128 * 1024 * 1024, storage="device"):
+        """Cache FP32 encoder tokens, preserving actual batch width and slot.
+
+        This is single-owner inference state, disabled by default. A partial
+        miss still encodes the entire original batch; only all-hit batches
+        skip encoding. CPU storage copies bits without quantization.
+        """
+        if type(max_bytes) is not int or max_bytes < 1 or storage not in {"device", "cpu"}:
+            raise ValueError("Use a positive token-cache byte limit and device or cpu storage.")
+        self.clear_token_cache("reconfigured")
+        self._token_cache = OrderedDict()
+        self._token_cache_max_bytes = max_bytes
+        self._token_cache_storage = storage
+        self._token_cache_bytes = 0
+        self._token_cache_context = None
+        self._token_cache_stats = dict(batch_hits=0, batch_misses=0, rows_reused=0,
+                                       rows_encoded=0, evictions=0, clears=0)
+        self._token_cache_last_clear = None
+        self._token_cache_cuda_auto = False  # Explicit calls are a manual opt-in.
+
+    def clear_token_cache(self, reason="explicit"):
+        cache = getattr(self, "_token_cache", None)
+        if cache is not None:
+            cache.clear()
+        self._token_cache_bytes = 0
+        self._token_cache_context = None
+        stats = getattr(self, "_token_cache_stats", None)
+        if stats is not None:
+            stats["clears"] += 1
+            self._token_cache_last_clear = reason
+
+    def disable_token_cache(self):
+        self.clear_token_cache("disabled")
+        self._token_cache = None
+        self._token_cache_cuda_auto = False
+
+    @property
+    def token_cache_info(self):
+        return dict(enabled=getattr(self, "_token_cache", None) is not None,
+                    cuda_auto=getattr(self, "_token_cache_cuda_auto", False),
+                    policy=TOKEN_CACHE_POLICY, run_local=True,
+                    storage=getattr(self, "_token_cache_storage", None),
+                    max_bytes=getattr(self, "_token_cache_max_bytes", 0),
+                    current_bytes=getattr(self, "_token_cache_bytes", 0),
+                    entries=len(getattr(self, "_token_cache", None) or ()),
+                    last_clear=getattr(self, "_token_cache_last_clear", None),
+                    **getattr(self, "_token_cache_stats", {}))
+
+    def _encode_cached(self, batch, images):
+        cache = self._token_cache
+        context = (self.weights_id, self.preprocess_id, self.precision, self.device,
+                   str(batch.device), str(batch.dtype), len(images), self.max_batch)
+        if context != self._token_cache_context:
+            self.clear_token_cache("inference_context_changed")
+            self._token_cache_context = context
+        if batch.dtype != torch.float32 or self._net.training or self._net.encoder.training:
+            self.clear_token_cache("non_fp32_or_training")
+            return self._net.encoder(batch)
+        keys = [(context, slot, hashlib.sha256(_rgb_array(image).tobytes(order="C")).digest())
+                for slot, image in enumerate(images)]
+        if all(key in cache for key in keys):
+            cached = [cache[key] for key in keys]
+            for key in keys:
+                cache.move_to_end(key)
+            self._token_cache_stats["batch_hits"] += 1
+            self._token_cache_stats["rows_reused"] += len(images)
+            return torch.stack(cached).to(device=batch.device, dtype=torch.float32)
+        # Never encode a width-1/2 subset of an original width-3 batch.
+        encoded = self._net.encoder(batch)
+        self._token_cache_stats["batch_misses"] += 1
+        self._token_cache_stats["rows_encoded"] += len(images)
+        if encoded.dtype != torch.float32 or encoded.shape[0] != len(images):
+            self.clear_token_cache("unexpected_encoder_layout")
+            return encoded
+        row_bytes = encoded[0].numel() * encoded.element_size()
+        if row_bytes > self._token_cache_max_bytes:
+            return encoded
+        for key, token in zip(keys, encoded):
+            previous = cache.pop(key, None)
+            if previous is not None:
+                self._token_cache_bytes -= previous.numel() * previous.element_size()
+                del previous
+            while cache and self._token_cache_bytes + row_bytes > self._token_cache_max_bytes:
+                _, evicted = cache.popitem(last=False)
+                self._token_cache_bytes -= evicted.numel() * evicted.element_size()
+                self._token_cache_stats["evictions"] += 1
+                del evicted
+            target = "cpu" if self._token_cache_storage == "cpu" else batch.device
+            # Independent row storage makes the byte limit bound retained tensors.
+            cache[key] = token.detach().to(device=target, dtype=torch.float32).clone()
+            self._token_cache_bytes += row_bytes
+        return encoded
 
     def _batch(self, images):
         batch = torch.from_numpy(np.stack([_rgb_array(image) for image in images]))
@@ -276,7 +377,13 @@ class Matcher:
     def _forward(self, queries, references):
         query_batch, reference_batch = self._batch(queries), self._batch(references)
         with _full_precision(self.device):
-            return self._net(query_batch, reference_batch).to(device="cpu", dtype=torch.float32).numpy()
+            if getattr(self, "_token_cache", None) is None:
+                scores = self._net(query_batch, reference_batch)
+            else:
+                query_tokens = self._encode_cached(query_batch, queries)
+                reference_tokens = self._encode_cached(reference_batch, references)
+                scores = self._net.heads["cls_head"](self._net.fusion(query_tokens, reference_tokens))
+            return scores.to(device="cpu", dtype=torch.float32).numpy()
 
     @torch.inference_mode()
     def score_pairs(self, query_images, reference_images):
@@ -290,6 +397,7 @@ class Matcher:
             try:
                 scores = self._forward(query_images[offset:offset + width], reference_images[offset:offset + width])
             except (RuntimeError, NotImplementedError) as exc:
+                self.clear_token_cache("inference_exception")
                 if self.device == "cpu":
                     raise
                 previous = self.device
@@ -303,7 +411,11 @@ class Matcher:
                     self.fallbacks.append(f"{previous} inference failed; using CPU")
                 self._release_accelerator(previous)
                 continue
+            except BaseException:
+                self.clear_token_cache("inference_exception")
+                raise
             if scores.shape != (width,) or scores.dtype != np.float32 or not np.isfinite(scores).all() or np.any((scores < 0) | (scores > 1)):
+                self.clear_token_cache("invalid_score")
                 raise ValueError("Matcher returned invalid classification scores.")
             chunks.append(scores)
             offset += width

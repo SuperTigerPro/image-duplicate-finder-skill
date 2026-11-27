@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import struct
 import tempfile
 import unittest
 import zipfile
@@ -14,7 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 try:
     import numpy as np
-    from PIL import Image, PngImagePlugin
+    from PIL import Image, ImageOps, PngImagePlugin
     import copynce_engine as engine
     import copynce_sn as sn
 except ImportError:
@@ -122,6 +123,55 @@ class ScoreNormalizationTests(unittest.TestCase):
         self.assertIn(pixel, index.pixel_sha256)
         _, info = sn.compute_bias(index.vectors[:1], index, excluded_sha256=[raw], excluded_pixel_sha256=[pixel])
         self.assertEqual((info["background_images_used"], info["overlap_excluded"]), (7, 1))
+
+    def test_rgb_pixel_hash_matches_full_byte_formula_across_stripe_boundaries_without_mutation(self):
+        rng = np.random.default_rng(581)
+        for height in (1, 127, 128, 129, 256, 257):
+            with self.subTest(height=height):
+                pixels = rng.integers(0, 256, (height, 19, 3), dtype=np.uint8)
+                with Image.fromarray(pixels) as image:
+                    image.info["fixture"] = "metadata retained"
+                    image.readonly = 1
+                    original = image.tobytes()
+                    metadata = dict(image.info)
+                    expected = hashlib.sha256(b"copynce-oriented-rgb-full-v1\0" +
+                                              struct.pack(">QQ", *image.size) + original).hexdigest()
+                    self.assertEqual(sn._rgb_pixel_sha256(image), expected)
+                    self.assertEqual((image.mode, image.size, image.readonly), ("RGB", (19, height), 1))
+                    self.assertEqual(image.tobytes(), original)
+                    self.assertEqual(image.info, metadata)
+
+    def test_record_pixel_hash_png_jpeg_and_exif_match_independent_formula(self):
+        rng = np.random.default_rng(729)
+        for filename, orientation in (("hash.png", None), ("hash.jpg", None),
+                                      ("rotated6.jpg", 6), ("rotated8.jpg", 8)):
+            with self.subTest(filename=filename):
+                path = self.root / filename
+                with Image.fromarray(rng.integers(0, 256, (259, 137, 3), dtype=np.uint8)) as image:
+                    if orientation is None:
+                        image.save(path)
+                    else:
+                        metadata = Image.Exif()
+                        metadata[274] = orientation
+                        image.save(path, exif=metadata)
+                info = path.stat()
+                record = engine.core.ImageFile(path, info.st_size, engine.core.signature(info))
+                with Image.open(path) as image, ImageOps.exif_transpose(image) as oriented, oriented.convert("RGB") as rgb:
+                    expected = hashlib.sha256(b"copynce-oriented-rgb-full-v1\0" +
+                                              struct.pack(">QQ", *rgb.size) + rgb.tobytes()).hexdigest()
+                with mock.patch.object(sn, "_rgb_pixel_sha256", wraps=sn._rgb_pixel_sha256) as shared:
+                    self.assertEqual(sn.pixel_sha256(record), expected)
+                    shared.assert_called_once()
+
+    def test_shared_hash_requires_rgb_and_record_safety_still_precedes_it(self):
+        with Image.new("L", (3, 5)) as gray, self.assertRaises(ValueError):
+            sn._rgb_pixel_sha256(gray)
+        path = self.images / "background-0.png"
+        info = path.stat()
+        record = engine.core.ImageFile(path, info.st_size, engine.core.signature(info))
+        with mock.patch.object(sn, "_rgb_pixel_sha256") as shared, self.assertRaises(ValueError):
+            sn.pixel_sha256(record, max_pixels=1)
+        shared.assert_not_called()
 
     def test_source_group_exclusion_and_insufficient_background(self):
         groups = {str(p): "shared" if i < 2 else f"family-{i}"

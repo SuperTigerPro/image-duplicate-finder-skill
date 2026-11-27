@@ -3,7 +3,7 @@ name: image-duplicate-finder-skill
 description: 检查用户选定的图片文件或目录，查找严格重复、静态整图相似或疑似跨图局部复用。支持 SHA-256、完整解码像素、整图相似和可选的本地或 SSH 云端 CopyNCE。适用于核查裁剪、拼接和嵌套。输出路径、分数、匹配区域和 CSV/JSON/Markdown 报告。
 license: MIT
 metadata:
-  version: "1.3.0"
+  version: "1.3.1"
 ---
 
 # 图片查重与疑似复用核查
