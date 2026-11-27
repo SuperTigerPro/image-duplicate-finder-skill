@@ -208,6 +208,18 @@ class WeightPreparationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "指定的模型 Python"):
                 setup._environment(False)
 
+    def test_enhanced_setup_includes_default_sn_without_user_background(self):
+        output = io.StringIO()
+        background = self.base / "background"
+        with mock.patch.object(sys, "argv", ["copynce_setup.py", "--quality", "enhanced", "--offline"]), \
+                mock.patch("copynce_default_sn.prepare_default_sn", return_value=background) as prepare_sn, \
+                mock.patch.object(setup, "prepare_enhanced", return_value=(self.base, self.base, self.base)), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(setup.main(), 0)
+        import json
+        self.assertEqual(json.loads(output.getvalue())["sn_index"], str(background))
+        prepare_sn.assert_called_once_with()
+
     def test_cache_permission_failure_is_generic_and_does_not_retry_installs(self):
         first, second = self.base / "signed-host", self.base / "alternate-python"
         with mock.patch.dict(os.environ, {setup.PYTHON_ENV:""}), \

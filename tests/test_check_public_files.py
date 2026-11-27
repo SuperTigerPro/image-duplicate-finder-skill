@@ -63,7 +63,10 @@ class PublicPackageTests(unittest.TestCase):
             for name in guard.PUBLIC_FILES:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("public source\n")
+                if name in guard.REVIEWED_ASSETS:
+                    path.write_bytes((ROOT / name).read_bytes())
+                else:
+                    path.write_text("public source\n")
                 if name in guard.EXECUTABLES:
                     path.chmod(0o755)
             skill = root / "SKILL.md"
@@ -102,6 +105,25 @@ class PublicPackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Incomplete release"):
                 guard.write_zip(destination, {"SKILL.md": b"public"})
             self.assertFalse(destination.exists())
+
+    def test_only_exact_reviewed_assets_are_publishable(self):
+        for name in guard.REVIEWED_ASSETS:
+            data = (ROOT / name).read_bytes()
+            guard.audit({name: data}, [])
+            changed = bytearray(data)
+            changed[-1] ^= 1
+            with self.subTest(asset=name), self.assertRaisesRegex(ValueError, "checksum"):
+                guard.audit({name: bytes(changed)}, [])
+            with self.assertRaises(ValueError):
+                guard.audit({name: data + b"extra bytes"}, [])
+        with self.assertRaisesRegex(ValueError, "binary"):
+            guard.audit({"SKILL.md": b"unexpected\0payload"}, [])
+
+    def test_reviewed_assets_still_check_private_identifiers(self):
+        name = "assets/sn-openimages-1000/attribution.csv"
+        data = (ROOT / name).read_bytes()
+        with self.assertRaisesRegex(ValueError, "site-specific"):
+            guard.audit({name: data}, ["original landing".replace(" ", "") + "url"])
 
     def test_worktree_checks_untracked_files_and_symlinks(self):
         with self.repository() as (root, git, audit, env):

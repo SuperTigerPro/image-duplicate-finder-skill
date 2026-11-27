@@ -107,7 +107,7 @@
           "sn_background": {
             "type": "string",
             "pattern": "^[A-Za-z0-9_-]{1,64}$",
-            "description": "Only local enhanced/deep. Anonymous background index ID bound by the host; never a file path. Cloud background is configured on the server."
+            "description": "Optional override for local enhanced/deep. Omit to use the bundled 1,000-image Open Images SN background. If supplied, use an anonymous index ID registered by the host, never a file path. Cloud background is selected on the server, which uses the bundled background when no custom index is configured."
           },
           "candidate_k": {
             "type": "integer",

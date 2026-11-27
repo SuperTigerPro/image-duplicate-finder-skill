@@ -37,7 +37,7 @@ def parse(argv):
     p.add_argument("--quality", choices=("fast", "enhanced", "deep"), default="fast",
                    help="fast=兼容旧版；enhanced=官方SN与Matcher；deep=官方代码LCE")
     p.add_argument("--matcher-weights", type=Path, help="本机官方 Matcher 权重；缺省按需下载")
-    p.add_argument("--sn-index", type=Path, help="仓库外的独立 SN 背景索引目录（本机）")
+    p.add_argument("--sn-index", type=Path, help="自定义私有 SN 背景索引；省略使用随包 Open Images 1000 图背景（本机）")
     p.add_argument("--candidate-k", type=core.positive_integer, default=32)
     p.add_argument("--matcher-budget", type=core.positive_integer, default=10000)
     p.add_argument("--local-view-pairs", type=core.positive_integer, default=2)
@@ -181,11 +181,11 @@ def local_scan(records, args, options):
         python, weights = setup.prepare(weights=args.weights, offline=args.offline, device=args.device)
         enhanced = {}
     else:
-        if args.sn_index is None:
-            raise ValueError("增强模式需要独立背景索引：先用 copynce_setup.py --build-sn-index 准备，再指定 --sn-index")
+        sn_index = (args.sn_index.expanduser().absolute() if args.sn_index is not None
+                    else _module("copynce_default_sn").prepare_default_sn())
         python, weights, matcher = setup.prepare_enhanced(
             weights=args.weights, matcher_weights=args.matcher_weights, offline=args.offline, device=args.device)
-        enhanced = dict(matcher_weights=str(matcher), sn_index=str(args.sn_index.expanduser().absolute()))
+        enhanced = dict(matcher_weights=str(matcher), sn_index=str(sn_index))
     req = {"paths": list(records), "file_stamps": {name: item.stamp for name, item in records.items()},
            "weights": str(weights), "cache": str(setup.user_cache() / "descriptors.sqlite3"),
            "options": dict(options, **enhanced, device=args.device, batch_size=args.batch_size, max_pixels=args.max_pixels)}

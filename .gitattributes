@@ -3,3 +3,6 @@
 *.md text eol=lf
 *.yml text eol=lf
 *.txt text eol=lf
+assets/sn-openimages-1000/manifest.json text eol=lf
+assets/sn-openimages-1000/attribution.csv text eol=lf
+assets/sn-openimages-1000/features.npz binary

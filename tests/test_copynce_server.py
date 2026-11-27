@@ -43,6 +43,41 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(info["dimension"], 512)
         self.assertEqual(server.resolve_directory(cfg, "."), self.images)
 
+    def test_fast_configuration_does_not_prepare_background_or_models(self):
+        with mock.patch.object(server, "_default_sn_index", side_effect=AssertionError("fast must not prepare SN")):
+            cfg = server.load_settings(self.config)
+            info = server.get_info(cfg)
+        self.assertIsNone(cfg.sn_index)
+        self.assertEqual(info["supported_profiles"], ["fast"])
+
+    def test_matcher_configuration_binds_default_background_to_upload_job(self):
+        import copynce_remote_jobs as jobs
+        matcher = self.home / "matcher"
+        matcher.write_bytes(b"fixture")
+        background = self.home / "default-background"
+        background.mkdir()
+        self.write_config(matcher_weights=str(matcher))
+        with mock.patch.object(server, "_default_sn_index", return_value=background) as prepare:
+            cfg = server.load_settings(self.config)
+        prepare.assert_called_once_with(self.cache)
+        self.assertEqual(cfg.sn_index, background)
+        self.assertEqual(cfg.matcher_weights, matcher)
+        with mock.patch.object(server, "require_profile") as validate, \
+             mock.patch.object(jobs, "create_job", return_value={}) as create:
+            server.prepare_upload_job(cfg, "a" * 32, "enhanced", "b" * 64)
+        validate.assert_called_once_with(cfg, "enhanced", "b" * 64)
+        self.assertEqual(create.call_args.args[1]["sn_index"], str(background))
+        self.assertTrue(create.call_args.kwargs["allow_auxiliary"])
+
+    def test_explicit_background_is_never_replaced_by_default(self):
+        self.write_config(matcher_weights=str(self.home / "matcher"),
+                          sn_index=str(self.home / "missing-custom-background"))
+        with mock.patch.object(server, "_default_sn_index", side_effect=AssertionError("explicit SN must win")):
+            cfg = server.load_settings(self.config)
+            self.assertEqual(cfg.sn_index, self.home / "missing-custom-background")
+            with self.assertRaisesRegex(ValueError, "verified Matcher"):
+                server.require_profile(cfg, "enhanced")
+
     def test_directory_scope_and_symlink_components(self):
         cfg = server.load_settings(self.config)
         for value in ("..", "../images", str(self.home), str(self.weights)):

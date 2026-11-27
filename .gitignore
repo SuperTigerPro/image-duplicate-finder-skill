@@ -46,6 +46,7 @@ known_hosts*
 
 # Private SN resources and intermediate tensors.
 *.npz
+!assets/sn-openimages-1000/features.npz
 *.npy
 backgrounds/
 sn-index*/

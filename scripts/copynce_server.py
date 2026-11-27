@@ -61,6 +61,15 @@ class Settings:
     sn_index: Path | None = None
 
 
+def _default_sn_index(cache):
+    """Materialize the public background beside the server's private cache."""
+    if __package__:
+        from .copynce_default_sn import prepare_default_sn
+    else:
+        from copynce_default_sn import prepare_default_sn
+    return safe_path(str(prepare_default_sn(cache_dir=cache.parent / "sn-backgrounds")))
+
+
 def load_settings(config=None):
     raw = config or os.environ.get("COPYNCE_CONFIG") or str(Path.home() / ".config" / "image-duplicate-finder" / "server.json")
     path = safe_path(str(raw))
@@ -98,6 +107,8 @@ def load_settings(config=None):
         raise ValueError("Invalid server resource limits")
     matcher = safe_path(obj["matcher_weights"], exists=False) if "matcher_weights" in obj else None
     sn_index = safe_path(obj["sn_index"], exists=False) if "sn_index" in obj else None
+    if matcher is not None and "sn_index" not in obj:
+        sn_index = _default_sn_index(cache)
     for resource in (matcher, sn_index):
         if resource is not None:
             outside_worktrees(resource)

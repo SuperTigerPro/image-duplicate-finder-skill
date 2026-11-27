@@ -8,7 +8,7 @@ CopyNCE 增强流程用 Descriptor 召回整图和局部候选，以官方 SN �
 | `--quality enhanced` | Skill 推荐的模型调用：整图和局部召回、官方查询侧 SN、Matcher 双向整图及证据窗口复核 |
 | `--quality deep` | 同一候选流程，改用固定上游代码的双向 LCE；每个无序图对最多70个视图配对 |
 
-增强与深查需要独立背景索引和两份权重。资源缺失时明确失败，不静默降为 fast。
+增强与深查使用随包默认 SN 背景索引，并按需准备两份官方权重，用户无需提供背景图片。公共索引损坏、模型资源缺失或显式自定义资源无效时明确失败，不静默降为 fast。
 
 ## 本机模型
 
@@ -16,7 +16,7 @@ CopyNCE 增强流程用 Descriptor 召回整图和局部候选，以官方 SN �
 
 ~~~bash
 python3 scripts/find_duplicates.py "/path/to/selected-gallery" --mode copynce --backend local \
-  --quality enhanced --sn-index "/path/to/private-background/index" \
+  --quality enhanced \
   --summary-only --output-dir "/path/to/private-reports/model-001"
 
 # 离线运行须已有兼容依赖和校验通过的官方权重
@@ -30,6 +30,8 @@ python3 scripts/find_duplicates.py "/path/to/selected-gallery" --mode copynce --
 
 不同设备使用相同权重：Descriptor 为87,514,773字节，Matcher 为86,733,215字节，PyTorch 等依赖另占空间。模型分阶段运行，并限制 Matcher 批量。环境、权重和特征缓存默认放在用户缓存目录。首次准备可能联网下载公共依赖和权重；本机推理不上传图片。`--offline` 禁止自动补下载，缺少依赖或权重时明确失败。可用 `COPYNCE_PYTHON` 指向兼容解释器，用 `COPYNCE_CACHE_DIR` 指定仓库外的缓存位置。
 
+SN 索引随完整 Skill 分发，无需另行联网下载背景图片。省略 `--sn-index` 时自动校验并复制到仓库外私有缓存；环境和模型权重已准备好时，`--quality enhanced --offline` 也可使用默认 SN。只复制脚本而漏掉 `assets` 不属于完整安装，缺少默认资源时应重新获取完整 Skill。
+
 增强复核只生成本对实际使用的整图和局部窗口，最多以128MiB运行内缓存复用这些RGB窗口；该上限不包含原图解码和模型本身。窗口缓存不写磁盘，扫描结束后释放，命中时仍核对原文件身份。评分方向、窗口选择、插值和Matcher批量保持一致。
 
 CUDA增强复核在方向批次无需拆分时，自动使用最多128MiB的FP32编码缓存，复用双向评分中重复的图像编码。缓存按图像像素、模型、设备和实际批次位置区分，设备退回CPU时关闭自动编码缓存。
@@ -40,16 +42,20 @@ CUDA增强复核在方向批次无需拆分时，自动使用最多128MiB的FP32
 
 `--summary-only` 让本机扫描的终端输出仅包含统计；完整路径仍保存在私有报告中。该选项不等于报告已脱敏，向聊天模型回传内容前仍由宿主控制。
 
-## 官方 SN 背景索引与评分
+## 默认 SN 背景与自定义索引
 
-背景集须独立、获准使用，不默认取本次待查图库。可复用已登记且兼容的背景索引；没有时明确选择背景图片并建立私有索引：
+默认使用 [`assets/sn-openimages-1000`](../assets/sn-openimages-1000/README.md) 中的公共索引：从 Open Images validation 独立抽样 1,000 张图片，种子为20261127，使用官方 Descriptor 提取512维FP32整图特征。它与2026-11-27完整Copydays测试使用的背景一致；已核对与当时的Copydays图片无相同原始字节及规范RGB像素，未证明不存在所有跨库近似同源。索引约2.8MB，另附[逐图署名、许可及来源记录](../assets/sn-openimages-1000/attribution.csv)，不分发这1,000张原图。
+
+这是 Skill 构建的背景资源，使用官方 SN 算法；背景规模和来源不等同上游的 DISC21 百万训练图设置，也不保证对所有专业图库都是最佳选择。默认无需用户提供背景，运行时仍检查重叠并排除同一文件或完整RGB像素。固定哈希、模型及预处理版本检查通过后，索引才复制到仓库外私有缓存；修改随包文件不能绕过校验。
+
+需要自定义背景时，可以显式传 `--sn-index "/path/to/private-background/index"`。该选项优先于默认资源；路径无效、不兼容或校验失败时直接报错，不以默认背景替代。自定义背景须独立、获准使用，不取本次待查图库；已有兼容索引可直接复用，或者先从明确选定的图片构建：
 
 ~~~bash
 python3 scripts/copynce_setup.py --build-sn-index "/path/to/private-background/index" \
   --provenance "independent-authorized-background" "/path/to/approved-background-images"
 ~~~
 
-至少需要5张去重后可用的背景图；与本次输入重合的文件及完整RGB像素会被排除，排除后仍须至少5张。来源组标签可通过Python接口提供；没有标签时不能保证不同变体属于不同来源，用户仍需选择独立背景集。构建与使用均只读原图，不训练模型。索引以600权限文件和700目录保存在仓库外，含全局FP32特征、内容摘要、模型及预处理版本、来源信息和完整性指纹，不含图片路径。
+自定义索引至少需要5张去重后可用的背景图；与本次输入重合的文件及完整RGB像素会被排除，排除后仍须至少5张。来源组标签可通过Python接口提供；没有标签时不能保证不同变体属于不同来源，自定义背景仍须核实其独立性。构建与使用均只读原图，不训练模型。运行索引及自定义索引保存在仓库外，Unix上使用600权限文件和700目录；索引含全局FP32特征、内容摘要、模型及预处理版本、来源信息和完整性指纹，不含图片路径。
 
 采用[固定上游代码](https://github.com/eddielyc/CopyNCE/blob/c2223d18abf3289202666a0d2b9db1c3a7f1b483/scripts/run/score_normalization.py)的参数 `alpha=1,start=1,end=5`：Q/R/A逐行L2归一化，查询与背景相似度降序排列，取Python切片 `[1:5]`，从查询与参考的整图余弦减去这4个近邻的平均相似度。SN不是概率，可能超出余弦范围；同一查询的参考排名不变。现有22视图最高余弦保留为独立局部召回通道，不把它减去整图偏置后称为官方SN。
 
@@ -84,7 +90,7 @@ profile 必须在所有 Git 工作树之外，Unix 上属于当前用户并设�
 | `identity_file`、`ssh_config` | 可选，本机密钥文件或 SSH 配置文件路径 |
 | `jump_host`、`control_path` | 可选，跳板机或本机已认证的 SSH 复用套接字 |
 
-profile 不支持密码或私钥正文等字段。真实地址、账号、认证信息、私有配置、图像、特征、含路径报告和运行日志都严禁提交到 GitHub；发布包只包含经检查的公共源码。
+profile 不支持密码或私钥正文等字段。真实地址、账号、认证信息、私有配置、用户图像及其特征、含路径报告和运行日志都严禁提交到 GitHub；发布包只包含经检查的公共源码和默认 SN 公共资源。
 
 ## 自有服务器部署
 
@@ -104,7 +110,6 @@ CUDA 构建应与服务器驱动和 Python 兼容，参见 [PyTorch 安装说明
 {
   "weights": "/path/to/private-models/descriptor_vits_224.pth.tar",
   "matcher_weights": "/path/to/private-models/matcher_vits_224.pth.tar",
-  "sn_index": "/path/to/private-background/index",
   "image_roots": ["/path/to/approved-gallery"],
   "cache": "/path/to/private-cache/features.sqlite3",
   "device": "auto",
@@ -113,13 +118,15 @@ CUDA 构建应与服务器驱动和 Python 兼容，参见 [PyTorch 安装说明
 }
 ~~~
 
+服务器已配置 `matcher_weights` 且省略 `sn_index` 时，自动使用该完整 Skill 自带的默认 SN，校验后放入服务器仓库外缓存。需要自定义背景才在配置中增加 `"sn_index": "/path/to/private-background/index"`，其无效时不会静默改用默认。也可运行 `python3 scripts/copynce_setup.py --quality enhanced` 准备两份权重和默认 SN，JSON 输出中的 `sn_index` 可用于私有配置；离线时仍须已有兼容环境和权重。
+
 profile 的 `launcher` 指向远端 Skill 根目录的 `start-mcp`。它默认使用 `.venv/bin/python`；服务器环境的 `COPYNCE_PYTHON` 可指定解释器，`COPYNCE_CONFIG` 可指定私有配置。通过 SSH stdio 按需启动，不开放公网 HTTP 端口。
 
 自定义 launcher 包装脚本必须尊重调用者已设置的 `COPYNCE_CONFIG`，只在变量未设置时补默认配置，例如使用 `${COPYNCE_CONFIG:-/path/to/private-config/server.json}`。上传客户端会为每个任务传入隔离图库配置；包装器若无条件覆盖该变量，客户端会在传图前发现图库或缓存范围不符并拒绝上传。
 
 内置服务强制 `image_roots` 边界，拒绝根路径及输入路径经过符号链接，扫描时固定选中文件身份。客户端的远端目录扫描默认要求服务器声明严格图库边界；CLI 不提供放宽此限制的开关。服务使用与本机相同的推理引擎，工作子进程在取消或会话结束时受控回收。
 
-增强客户端传图前协商API2、schema4、两份实际权重哈希、SN实现与背景索引指纹；缺资源或版本不兼容时停止。背景索引是独立只读资源，不加入扫描 `image_roots`，上传任务也不能指定任意背景路径。后台索引在服务器准备或经单独授权传输；允许上传本次图片不等于允许上传背景数据。CPU回退仅改变当前执行地点的设备，不改变数据驻留位置。
+增强客户端传图前协商API2、schema4、两份实际权重哈希、SN实现与背景索引指纹；缺资源或版本不兼容时停止。背景索引是独立只读资源，不加入扫描 `image_roots`，上传任务也不能指定任意背景路径。默认背景随服务器 Skill 分发，不从客户端上传；自定义背景在服务器准备或经单独授权传输，允许上传本次图片不等于允许上传私有背景数据。CPU回退仅改变当前执行地点的设备，不改变数据驻留位置。
 
 ## 图库已经在服务器
 
@@ -173,6 +180,7 @@ python3 scripts/find_duplicates.py --mode copynce --backend cloud \
 | `--matcher-budget 10000` | 本次最多新增核验的无序图对数；缓存不占预算，计划未完成返回1 |
 | `--local-view-pairs 2` | 增强档每个方向额外复核的局部证据视图数 |
 | `--sn-extra-budget 1000` | 基础候选之外，以SN排序并限制每图份额的额外候选预算 |
+| `--sn-index DIR` | 本机增强/深查的可选自定义背景索引；省略时使用随包默认背景 |
 | `--whole-only` | 只比较整图；默认比较整图及固定局部裁块 |
 | `--search-mode auto` | 自动选择；fast 的 `exact` 枚举所有选中图对，`indexed` 近似检索；增强/深查目前仅支持 exact 或 auto，auto 使用精确分块召回 |
 | `--top-k 100` | 最多返回的图对数；达到阈值的候选更多时报告标明截断 |

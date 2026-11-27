@@ -1,4 +1,4 @@
 interface:
   display_name: "图片查重与复用核查"
-  short_description: "只读查找严格重复与疑似复用，可选本地或自有服务器模型并输出私有报告"
+  short_description: "只读查找重复与疑似复用，可选本地或服务器模型，内置SN背景并输出私有报告"
   default_prompt: "用 $image-duplicate-finder-skill 检查我指定的图片目录，选择普通查重或本地、云端模型查重，输出完整路径和私有报告，保留原图。"

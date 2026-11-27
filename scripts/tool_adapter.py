@@ -118,11 +118,11 @@ def run_request(request, allowed_roots, report_root, *, allow_model=False, remot
                 raise ValueError("远端配置仅用于 cloud 模式")
             if model_offline:
                 arguments.append("--offline")
-            if quality != "fast":
-                background = request.get("sn_background")
+            if quality != "fast" and "sn_background" in request:
+                background = request["sn_background"]
                 if (not isinstance(background, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", background)
                         or background not in (sn_indices or {})):
-                    raise ValueError("增强模式需要宿主授权的匿名 sn_background ID")
+                    raise ValueError("自定义背景需要宿主授权的匿名 sn_background ID")
                 arguments += ["--sn-index", str(sn_indices[background])]
         else:
             if "sn_background" in request:

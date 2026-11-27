@@ -1,5 +1,6 @@
 """Audit the Git index or a committed tree and create/verify a public Skill ZIP."""
 import argparse
+import hashlib
 import io
 import ipaddress
 import os
@@ -23,6 +24,9 @@ scripts/check_public_files.py scripts/find_duplicates.py scripts/image_similarit
 scripts/copynce_cli.py scripts/copynce_cloud.py scripts/copynce_engine.py scripts/copynce_model.py
 scripts/copynce_remote_jobs.py scripts/copynce_report.py scripts/copynce_server.py scripts/copynce_setup.py
 scripts/copynce_matcher.py scripts/copynce_sn.py scripts/copynce_pipeline.py
+scripts/copynce_default_sn.py tests/test_copynce_default_sn.py
+assets/sn-openimages-1000/README.md assets/sn-openimages-1000/manifest.json
+assets/sn-openimages-1000/features.npz assets/sn-openimages-1000/attribution.csv
 tests/test_check_public_files.py tests/test_copynce_cli.py tests/test_copynce_cloud.py
 tests/test_copynce_engine.py tests/test_copynce_server.py tests/test_copynce_setup.py tests/test_copynce_model.py
 tests/test_copynce_matcher.py tests/test_copynce_sn.py tests/test_copynce_pipeline.py tests/test_copynce_remote_jobs.py
@@ -32,6 +36,15 @@ tests/test_tool_adapter.py third_party/CopyNCE-LICENSE
 """.split())
 EXECUTABLES = {"start-mcp", ".githooks/pre-commit", ".githooks/pre-push"}
 MAX_BYTES = 1024 * 1024
+# Only these fixed reviewed public assets bypass the generic source-text scan.
+# The attribution preserves public authors/titles verbatim, including strings
+# that resemble logins or addresses. Any changed byte requires a new review.
+REVIEWED_ASSETS = {
+    "assets/sn-openimages-1000/features.npz":
+        (2817052, "15d75894446c9a701606e6514434232941fb49101a58aa0ab39b4f0912dcbf6c"),
+    "assets/sn-openimages-1000/attribution.csv":
+        (322325, "4bc80eab9b1f5796350f8b69efdd40c99e2c98dfb697394e9b427bffc2275e7a"),
+}
 OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 # Reviewed upstream services for fetching public code, weights and dependencies.
@@ -41,6 +54,7 @@ PUBLIC_DOMAINS = {
     "pytorch.org", "docs.pytorch.org", "download.pytorch.org",
     "drive.google.com", "drive.usercontent.google.com", "docs.google.com",
     "modelcontextprotocol.io", "man.openbsd.org", "arxiv.org",
+    "storage.googleapis.com", "creativecommons.org",
 }
 EXAMPLE_DOMAINS = ("example.com", "example.org", "example.net", "example", "invalid", "test")
 CHECKS = {
@@ -113,6 +127,10 @@ def git(*args):
         raise ValueError("Git source query failed; inspect the repository locally (details withheld)") from None
 
 
+def size_limit(name):
+    return REVIEWED_ASSETS[name][0] if name in REVIEWED_ASSETS else MAX_BYTES
+
+
 def commit_id(revision):
     result = git("rev-parse", "--verify", "--end-of-options", revision + "^{commit}").strip().decode("ascii")
     if not OID.fullmatch(result):
@@ -138,7 +156,7 @@ def snapshot(commit, working_tree=False):
             if path.is_symlink() or not path.is_file() or any(p.is_symlink() for p in path.parents):
                 raise ValueError(f"{name}: expected a regular source file")
             info = path.stat()
-            if info.st_size > MAX_BYTES:
+            if info.st_size > size_limit(name):
                 raise ValueError(f"{name}: source file too large")
             if os.name != "nt" and name in EXECUTABLES and not info.st_mode & stat.S_IXUSR:
                 raise ValueError(f"{name}: missing executable permission")
@@ -167,7 +185,7 @@ def snapshot(commit, working_tree=False):
         if name in EXECUTABLES and mode != b"100755":
             raise ValueError(f"{name}: missing executable permission")
         oid = kind_or_oid if commit is None else oid_or_stage
-        if int(git("cat-file", "-s", oid)) > MAX_BYTES:
+        if int(git("cat-file", "-s", oid)) > size_limit(name):
             raise ValueError(f"{name}: source file too large")
         files[name] = git("cat-file", "blob", oid)
     if "SKILL.md" not in files:
@@ -179,8 +197,15 @@ def audit(files, private_terms):
     for name, data in files.items():
         if name not in PUBLIC_FILES:
             raise ValueError("Unapproved publication path (filename withheld)")
-        if len(data) > MAX_BYTES:
+        if len(data) > size_limit(name):
             raise ValueError(f"{name}: source file too large")
+        if name in REVIEWED_ASSETS:
+            expected_size, expected_sha256 = REVIEWED_ASSETS[name]
+            if len(data) != expected_size or hashlib.sha256(data).hexdigest() != expected_sha256:
+                raise ValueError(f"{name}: reviewed public asset checksum mismatch")
+            if any(term.encode("utf-8") in data.lower() for term in private_terms):
+                raise ValueError(f"{name}: site-specific value (value withheld)")
+            continue
         if b"\0" in data:
             raise ValueError(f"{name}: binary payload")
         try:

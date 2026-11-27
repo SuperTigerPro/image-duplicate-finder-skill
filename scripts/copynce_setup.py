@@ -502,8 +502,14 @@ def main():
         python, weights = prepare(args.weights, args.offline, args.device)
         result = {"python": str(python), "weights": str(weights)}
     else:
+        if __package__:
+            from .copynce_default_sn import prepare_default_sn
+        else:
+            from copynce_default_sn import prepare_default_sn
+        sn_index = prepare_default_sn()
         python, weights, matcher = prepare_enhanced(args.weights, args.matcher_weights, args.offline, args.device)
-        result = {"python": str(python), "weights": str(weights), "matcher_weights": str(matcher)}
+        result = {"python": str(python), "weights": str(weights), "matcher_weights": str(matcher),
+                  "sn_index": str(sn_index)}
     print(json.dumps(result, ensure_ascii=True))
     return 0
 

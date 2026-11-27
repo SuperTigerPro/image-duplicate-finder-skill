@@ -19,7 +19,7 @@
 
 - **similar（新增）**：静态整图相似检测，覆盖常见缩放、重新压缩和轻微亮度变化，用户只调相似度门槛，内部指标自动联动。
 
-- **copynce**：推荐增强模式，使用 Descriptor 整图/局部召回、官方 SN 与独立 Matcher 复核；提供快速兼容档和官方代码 LCE 深查档。分开输出余弦、双向 SN、分类分数和证据窗口。
+- **copynce**：推荐增强模式，使用 Descriptor 整图/局部召回、官方 SN 与独立 Matcher 复核；随包提供默认背景索引，无需用户准备 SN 图片。提供快速兼容档和官方代码 LCE 深查档，分开输出余弦、双向 SN、分类分数和证据窗口。
 
 ### 怎么选
 
@@ -43,7 +43,7 @@
 
 ## 作为 Skill 安装
 
-入口是根目录的 [SKILL.md](SKILL.md)，实现脚本随仓库一起分发。
+入口是根目录的 [SKILL.md](SKILL.md)，实现脚本和默认 SN 公共资源随仓库一起分发。
 
 1. 克隆或下载**整个仓库**，不要只复制说明文件。
 2. 在支持本地 Agent Skills 的客户端中导入这个目录；若客户端提供 GitHub Skill 导入功能，使用本仓库 URL。
@@ -140,13 +140,11 @@ Windows 使用 .venv\Scripts\python.exe 执行相同参数。
 
 ### 5. 模型查重
 
-增强模式需要独立、获准使用的背景图片集。首次建立索引后可重复使用：
+增强模式默认使用随包的 **1,000 张 Open Images 验证图片背景索引**，无需用户收集背景图片或下载这些原图：
 
 ~~~bash
-python3 scripts/copynce_setup.py --build-sn-index "/path/to/private-background/index" \
-  "/path/to/approved-background-images"
 python3 scripts/find_duplicates.py "/path/to/selected-gallery" --mode copynce --backend local \
-  --quality enhanced --sn-index "/path/to/private-background/index" \
+  --quality enhanced \
   --summary-only --output-dir "/path/to/private-reports/enhanced-001"
 ~~~
 
@@ -154,11 +152,13 @@ python3 scripts/find_duplicates.py "/path/to/selected-gallery" --mode copynce --
 
 `--quality enhanced` 合并每张图的整图/局部候选，官方查询侧SN分配额外候选预算，Matcher复核整图和少量证据窗口。`--quality deep` 对相同候选执行双向官方代码LCE，计算量更高；不能与 `--whole-only` 混用。旧命令省略质量档位时保持 `fast`，只使用Descriptor最高余弦。
 
-SN使用独立背景特征，不训练模型、不默认使用待查图库；索引必须在仓库外。背景与查询内容及完整RGB像素重合时排除，来源组隔离需要用户提供来源信息。SN不会改变单个查询的候选排名，也不直接修正Matcher分数。Matcher默认0.5是未校准起点，与快速模式0.75、similar的90和旧Copydays阈值分别独立。
+默认索引由 Skill 使用官方 Descriptor 构建，采用完整 Copydays 测试中的独立背景抽样（种子20261127、512维FP32）；它是 Skill 提供的公共背景资源，未复现官方 DISC21 百万图背景设置。运行时先校验固定哈希，再复制到仓库外私有缓存；模型环境和权重已齐备时也可离线使用。自定义背景是可选项，详见[背景索引说明](references/copynce.md#默认-sn-背景与自定义索引)。
+
+SN使用独立背景特征，不训练模型、不默认使用待查图库。背景与查询内容及完整RGB像素重合时排除；未证明所有近似同源均已排除，默认背景也不保证适合每种专业图库。SN不会改变单个查询的候选排名，也不直接修正Matcher分数。Matcher默认0.5是未校准起点，与快速模式0.75、similar的90和旧Copydays阈值分别独立。
 
 增强报告为schema4，分别记录召回、计划、成功核验、失败及待核验数量；达到新增复核预算而有候选未处理时返回1，输出top_k截断单列。本机/服务器已有图库可重跑复用已核验缓存继续，上传任务仍在结束后清理全部查询缓存。**模型只提供疑似复用候选**，高分和窗口不能替代严格重复核验或人工来源审查。公开基础模型的适用边界见 [CopyNCE上游说明](https://github.com/eddielyc/CopyNCE#fine-tuning)。
 
-本机离线、背景构建、服务器API2部署、传图前能力校验、默认去元数据传输和取消清理见[模型操作指南](references/copynce.md)。真实连接配置、背景特征、报告与日志均留在所有Git工作树之外。
+本机离线、自定义背景构建、服务器API2部署、传图前能力校验、默认去元数据传输和取消清理见[模型操作指南](references/copynce.md)。仅随包默认背景及其来源、许可记录公开分发；真实连接配置、用户图片及其特征、运行缓存、报告与日志均留在所有Git工作树之外。
 
 ### 常用参数
 
@@ -234,7 +234,7 @@ G0001 | 3 个路径 | <SHA-256>
 7. 隐藏项默认跳过；显式选定的隐藏根目录/文件不受该项过滤。符号链接始终不跟随；直接传入符号链接会报参数错误。重复/重叠输入路径只计算一次，硬链接的不同路径仍会列出。
 8. 检查文件的设备、inode、大小及修改/变更时间，尽量发现扫描过程中的修改。它不是事务型快照；请暂停图库同步或编辑后扫描。
 9. 报告只写入新目录，模型模式另有环境、权重和特征缓存。操作系统可能因读取而更新访问时间（atime）。如果磁盘写满，输出可能不完整；修复后用新目录重试。
-10. 普通查重和本地模型均在本机运行。云端上传须明确目的服务器和授权范围。真实连接配置、图片、报告、预览、缓存及日志均禁止提交到 GitHub。
+10. 普通查重和本地模型均在本机运行。云端上传须明确目的服务器和授权范围。真实连接配置、用户图片及其特征、报告、预览、运行缓存及日志均禁止提交到 GitHub；随包默认 SN 及其来源、许可记录作为公共资源分发。
 
 ## 测试与开发
 
@@ -263,7 +263,7 @@ python3 scripts/check_public_files.py --working-tree --write-archive "/path/to/p
 python3 scripts/check_public_files.py --working-tree --archive "/path/to/private-output/skill.zip"
 ~~~
 
-正式提交后可用 `--commit HEAD` 替换 `--working-tree`。打包只包含源码白名单，复核要求ZIP与对应源码逐字节一致。真实IP、登录用户名、口令、密钥、profile、图库、缓存、报告和日志均不得进入 GitHub、Actions、Issue、PR或发布附件。正常查重流程不执行 Git 提交或上传；`.gitignore`和GitHub秘密扫描只是补充防护。
+正式提交后可用 `--commit HEAD` 替换 `--working-tree`。打包只包含发布白名单中的源码与默认SN公共资源，复核要求ZIP与对应文件逐字节一致；二进制索引只按固定路径和哈希单独放行。真实IP、登录用户名、口令、密钥、profile、用户图库及其缓存、报告和日志均不得进入 GitHub、Actions、Issue、PR或发布附件。正常查重流程不执行 Git 提交或上传；`.gitignore`和GitHub秘密扫描只是补充防护。
 
 ## 目录
 
@@ -278,6 +278,7 @@ image-duplicate-finder-skill/
 ├── start-mcp                    # SSH stdio服务，无公网监听
 ├── agents/openai.yaml           # Skill界面元数据
 ├── adapters/chat-completions-tools.json
+├── assets/sn-openimages-1000/    # 默认SN公共索引与逐图来源、许可记录
 ├── tests/                       # 临时合成样本与安全/契约回归
 ├── references/similarity.md      # 单门槛、评分与检测范围
 ├── references/copynce.md         # 本地和云端模型指南
@@ -292,4 +293,4 @@ image-duplicate-finder-skill/
 
 ## 许可证
 
-原有代码使用 [MIT](LICENSE)。CopyNCE 移植代码保留 [Apache-2.0 许可](third_party/CopyNCE-LICENSE)与来源署名；权重从[作者发布页](https://github.com/eddielyc/CopyNCE#models)获取，不随 Skill 包重新上传。
+原有代码使用 [MIT](LICENSE)。CopyNCE 移植代码保留 [Apache-2.0 许可](third_party/CopyNCE-LICENSE)与来源署名；权重从[作者发布页](https://github.com/eddielyc/CopyNCE#models)获取，不随 Skill 包重新上传。默认 SN 背景资源保留[逐图来源、署名和许可记录](assets/sn-openimages-1000/attribution.csv)，不将代码的 MIT 许可扩展为对来源图片的重新许可。

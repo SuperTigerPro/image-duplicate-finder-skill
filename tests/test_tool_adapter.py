@@ -107,6 +107,38 @@ class ToolAdapterTests(Fixture):
                 with self.subTest(change=change), self.assertRaises(ValueError):
                     adapter.run_request(dict(req, **change), [self.images], self.root / "reports", **kwargs)
 
+    def test_enhanced_and_deep_use_bundled_background_when_id_is_omitted(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import tool_adapter as adapter
+        import copynce_cli
+        def finish(arguments):
+            out = Path(arguments[arguments.index("--output-dir") + 1]);out.mkdir(parents=True)
+            (out / "duplicates.json").write_text('{"schema_version":4,"matches":[]}')
+            return 0
+        for quality in ("enhanced", "deep"):
+            request = self.request(mode="copynce", model_quality=quality,
+                                   output_dir=str(self.root / "reports" / quality))
+            with self.subTest(quality=quality), \
+                 mock.patch.object(copynce_cli, "main", side_effect=finish) as execute:
+                result = adapter.run_request(request, [self.images], self.root / "reports", allow_model=True)
+                arguments = execute.call_args.args[0]
+                self.assertTrue(result["ok"])
+                self.assertEqual(arguments[arguments.index("--quality") + 1], quality)
+                self.assertNotIn("--sn-index", arguments)
+                self.assertNotIn("--allow-upload", arguments)
+
+    def test_explicit_unknown_or_empty_background_never_falls_back_to_default(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import tool_adapter as adapter
+        import copynce_cli
+        for background in (None, "", "unregistered", "/path/to/background", True):
+            with self.subTest(background=background), \
+                 mock.patch.object(copynce_cli, "main", side_effect=AssertionError("must reject")), \
+                 self.assertRaisesRegex(ValueError, "宿主授权"):
+                adapter.run_request(self.request(mode="copynce", model_quality="enhanced",
+                                                 sn_background=background),
+                                    [self.images], self.root / "reports", allow_model=True)
+
     def test_json_only_exact_roundtrip_and_reports(self):
         self.write("a.png")
         self.write("b.png")

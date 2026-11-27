@@ -213,10 +213,42 @@ class ModelCLITests(unittest.TestCase):
         req = json.loads(proc.call_args.kwargs["input"])
         self.assertEqual(req["file_stamps"][str(f)], list(records[str(f)].stamp))
 
-    def test_enhanced_requires_auxiliary_before_model_download(self):
+    def test_invalid_bundled_background_fails_before_model_download(self):
         f = self.file("selected.png")
-        with mock.patch("copynce_setup.prepare_enhanced", side_effect=AssertionError("must validate first")):
+        with mock.patch("copynce_default_sn.prepare_default_sn", side_effect=ValueError("bad bundled background")), \
+                mock.patch("copynce_setup.prepare_enhanced", side_effect=AssertionError("must validate first")):
             self.assertEqual(cli.main([str(f), "--quality", "enhanced"]), 2)
+
+    def test_local_enhanced_and_deep_automatically_bind_default_background(self):
+        f = self.file("selected.png")
+        for quality in ("enhanced", "deep"):
+            args = cli.parse([str(f), "--quality", quality, "--offline"])
+            records = {str(i.path): i for i in cli.select_inputs(args).files}
+            background = self.root / "private-background"
+            with mock.patch("copynce_default_sn.prepare_default_sn", return_value=background) as prepare_sn, \
+                    mock.patch("copynce_setup.prepare_enhanced", return_value=(sys.executable, f, f)), \
+                    mock.patch("copynce_setup.user_cache", return_value=self.root), \
+                    mock.patch("subprocess.run") as proc:
+                proc.return_value.returncode = 0
+                proc.return_value.stdout = "{}"
+                cli.local_scan(records, args, {})
+            prepare_sn.assert_called_once_with()
+            request = json.loads(proc.call_args.kwargs["input"])
+            self.assertEqual(request["options"]["sn_index"], str(background))
+
+    def test_explicit_background_is_forwarded_without_default_fallback(self):
+        f = self.file("selected.png")
+        custom = self.root / "missing-custom-background"
+        args = cli.parse([str(f), "--quality", "enhanced", "--sn-index", str(custom)])
+        with mock.patch("copynce_default_sn.prepare_default_sn", side_effect=AssertionError("explicit selection")), \
+                mock.patch("copynce_setup.prepare_enhanced", return_value=(sys.executable, f, f)), \
+                mock.patch("copynce_setup.user_cache", return_value=self.root), \
+                mock.patch("subprocess.run") as proc:
+            proc.return_value.returncode = 1
+            proc.return_value.stderr = "invalid custom background"
+            with self.assertRaisesRegex(RuntimeError, "invalid custom background"):
+                cli.local_scan({}, args, {})
+        self.assertEqual(json.loads(proc.call_args.kwargs["input"])["options"]["sn_index"], str(custom))
 
     def test_enhanced_cli_keeps_ssh_profile_separate_from_quality(self):
         args = cli.parse(["--backend", "cloud", "--profile", "private-profile", "--remote-directory", ".",
